@@ -1,0 +1,43 @@
+x-flagsmith-env: &flagsmith-env
+  DATABASE_URL: postgresql://flagsmith:${SANDBOX_DB_PASSWORD:?Generate a disposable database password}@postgres:5432/flagsmith
+  DJANGO_SECRET_KEY: ${SANDBOX_DJANGO_SECRET:?Generate a disposable Django secret}
+  DJANGO_ALLOWED_HOSTS: 127.0.0.1,localhost
+  FLAGSMITH_DOMAIN: localhost
+  TASK_RUN_METHOD: SYNCHRONOUSLY
+  USE_POSTGRES_FOR_ANALYTICS: 'true'
+  ENVIRONMENT: production
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: flagsmith
+      POSTGRES_USER: flagsmith
+      POSTGRES_PASSWORD: ${SANDBOX_DB_PASSWORD:?Generate a disposable database password}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD, pg_isready, -U, flagsmith, -d, flagsmith]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  migrate-db:
+    image: docker.flagsmith.com/flagsmith/flagsmith:2.263.0
+    command: [migrate]
+    environment: *flagsmith-env
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+  flagsmith:
+    image: docker.flagsmith.com/flagsmith/flagsmith:2.263.0
+    command: [serve]
+    environment: *flagsmith-env
+    ports:
+      - '127.0.0.1::8000'
+    depends_on:
+      migrate-db:
+        condition: service_completed_successfully
+volumes:
+  pgdata:

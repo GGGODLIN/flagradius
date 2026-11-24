@@ -1,0 +1,22 @@
+{
+  "name": "flagradius",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@flagsmith/nodejs": "9.5.0"
+  },
+  "devDependencies": {
+    "@flagsmith/cli": "2.0.0",
+    "@types/node": "24.19.2",
+    "fast-check": "4.10.2",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vitest": "4.1.12"
+  }
+}
