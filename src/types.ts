@@ -1,4 +1,9 @@
 export type FlagValue = string | number | boolean | null;
+
+export function isFlagValue(value: unknown): value is FlagValue {
+  return value === null || typeof value === 'string' || typeof value === 'boolean' || Number.isFinite(value);
+}
+
 export type ModeTag = 'LIVE_FLAGSMITH' | 'OFFLINE_FIXTURE_REPLAY';
 
 export interface FeatureState {

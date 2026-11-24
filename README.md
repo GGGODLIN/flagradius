@@ -41,7 +41,9 @@ The MCP tool can inspect flags, submit a proposal, or invoke the sandbox's read-
 
 For an MCP client, launch `node --import tsx src/mcp-guard.ts` from the repository. Pass `FLAGRADIUS_EXECUTOR_URL` (a loopback HTTP origin), `FLAGRADIUS_PROPOSAL_TOKEN`, and `FLAGRADIUS_MODE=LIVE_FLAGSMITH`. The sandbox uses `inspect_flags`, `propose_flag_change`, and `diagnose_flag_incident`. A pending proposal returns an `approval_url` for the operator. The MCP environment must exclude `FLAGSMITH_API_TOKEN` and `FLAGRADIUS_HUMAN_APPROVAL_TOKEN`.
 
-To use your own Flagsmith sandbox, set the options in [.env.example](/.env.example) in the executor's environment before running `npm run executor-daemon`. The local executor API accepts JSON via `POST /api/inspect` and `POST /api/propose`, authenticated with the proposal token as a bearer token. The demo also wires `POST /api/diagnose` to the timeline reader. The approval form runs on `/approvals/<request-id>` and uses the distinct operator token.
+To use your own Flagsmith sandbox, set the options in [.env.example](/.env.example) in the executor's environment before running `npm run executor-daemon`. The local executor API accepts JSON on `POST /api/inspect`, `POST /api/propose`, and `POST /api/diagnose`. Authenticate with the proposal token as a bearer token. The approval form at `/approvals/<request-id>` uses the distinct operator token.
+
+After an interrupted write, call `POST /admin/reconcile` with the operator token as a bearer token and a JSON body such as `{ "environment": "sandbox" }`. The route also accepts `application/x-www-form-urlencoded` with `token` and `environment` fields. The response reports the reconciliation status and includes the snapshot commit when it records an applied write.
 
 ## Diagnose against an existing timeline
 
@@ -58,6 +60,6 @@ Diagnosis walks the Git history in order so a flag that flipped more than once s
 - Run one executor per environment. Flagsmith writes lack server-side compare-and-swap, so the executor serializes its own writes and checks the live baseline just before acting. External edits can still race with a write.
 - Project-level changes to segment rules return `CROSS_ENV_LOCKED`. A segment rule can affect multiple environments.
 - Preview fails closed when creating a segment override that inherits nonzero multivariate weights. Flagsmith assigns the state ID used for rollout bucketing at creation time.
-- After an unconfirmed write, reconcile reads the live target before unlocking the environment. A third state keeps the environment locked for operator investigation.
+- Reconciliation reads the live target before unlocking the environment. An ambiguous read-back or drift after a verified write keeps the environment locked for operator investigation.
 
 [MIT License](/LICENSE)

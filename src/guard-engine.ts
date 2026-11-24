@@ -1,9 +1,10 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { evaluateTargetedBlastRadius } from './evaluator.js';
+import { evaluateTargetedImpact } from './evaluator.js';
 import { validateOperation } from './flagsmith-adapter.js';
 import { recordObject } from './receipt-store.js';
 import type { ApprovalPlan, ApprovalReason, Receipt, ReceiptEvent, ReceiptStore, RequestMetadata, TargetState, WriteContext } from './receipt-store.js';
+import { sortedJson } from './snapshot-store.js';
 import type { SnapshotStore } from './snapshot-store.js';
 import { FlagsmithError } from './types.js';
 import type { BlastRadiusResult, EnvironmentDocument, FeatureState, FlagWriteOperation, ModeTag, RosterEntry } from './types.js';
@@ -137,7 +138,7 @@ function cardFor(request: RequestMetadata, plan: ApprovalPlan): ApprovalCard {
     flag_name: operation.flag_name, target: operation.type, target_baseline_state: plan.target_baseline_state,
     ...('segment_id' in operation ? { segment_id: operation.segment_id } : {}),
     ...('identifier' in operation ? { identifier: operation.identifier } : {}),
-    baseline_revision: request.request_id, blast_radius: plan.blast_radius, reasons: plan.reasons,
+    baseline_revision: plan.baseline_revision, blast_radius: plan.blast_radius, reasons: plan.reasons,
   });
 }
 
@@ -225,19 +226,22 @@ export class GuardEngine {
         return { ...request, ...finding };
       }
       let after: EnvironmentDocument;
-      let blast_radius: BlastRadiusResult;
+      let impact: ReturnType<typeof evaluateTargetedImpact>;
       try {
         after = backend.applyOperationToDocument(before, op);
-        blast_radius = evaluateTargetedBlastRadius(before, after, op.flag_name, this.#roster);
+        impact = evaluateTargetedImpact(before, after, op.flag_name, this.#roster);
       } catch (error) {
         if (error instanceof FlagsmithError) return block(error.code);
         throw error;
       }
+      const { blast_radius, affected_identities_digest } = impact;
       const reasons = this.#approvalReasons(op, blast_radius);
+      const baseline = { provider_environment_id: before.id, provider_project_id: before.project.id, target_baseline_state: targetState(before, op) };
+      const fingerprint = JSON.stringify({ ...baseline, affected_identities_digest }, sortedJson);
+      const baseline_revision = `rev-${createHash('sha256').update(fingerprint).digest('hex').slice(0, 12)}`;
       const plan: ApprovalPlan = {
-        operation: op, declared_intent, blast_radius, reasons, roster_version: this.#rosterVersion,
-        target_baseline_state: targetState(before, op), expected_after_state: targetState(after, op),
-        provider_environment_id: before.id, provider_project_id: before.project.id,
+        ...baseline, operation: op, declared_intent, ...impact, reasons, roster_version: this.#rosterVersion,
+        expected_after_state: targetState(after, op), baseline_revision,
       };
       this.#append(request, { status: 'evaluated', blast_radius }, 'received');
       if (reasons.length > 0) {
@@ -254,6 +258,7 @@ export class GuardEngine {
     if (impact.total_flipped > this.#maxFlips) reasons.push('OVER_BUDGET');
     if (impact.vip_hits > 0) reasons.push('VIP_IMPACT');
     if (this.#protectedFlags.has(operation.flag_name)) reasons.push('PROTECTED_FLAG');
+    if ('identifier' in operation && !this.#roster.some(entry => entry.identifier === operation.identifier)) reasons.push('UNKNOWN_IDENTITY');
     return reasons;
   }
 
@@ -294,23 +299,25 @@ export class GuardEngine {
   }
 
   async #execute(request: RequestMetadata, backend: FlagsmithBackend, plan: ApprovalPlan, previous: 'auto_approved' | 'pending_approval'): Promise<GuardResult> {
-    const { roster_version, blast_radius, declared_intent, reasons, ...write } = plan;
+    const { roster_version, blast_radius, declared_intent, reasons, affected_identities_digest, baseline_revision: _revision, ...write } = plan;
     const { operation, target_baseline_state, expected_after_state } = write;
-    const live = await this.#fetchBaseline(request, backend, previous);
     const stale = (): GuardResult => {
       this.#append(request, { status: 'stale_approval' }, previous);
       return { ...request, status: 'stale_approval' };
     };
-    if (roster_version !== this.#rosterVersion || !sameProviderEnvironment(live, write)
+    if (!affected_identities_digest || roster_version !== this.#rosterVersion) return stale();
+    const live = await this.#fetchBaseline(request, backend, previous);
+    if (!sameProviderEnvironment(live, write)
       || !isDeepStrictEqual(targetState(live, operation), target_baseline_state)
       || intentFinding(live, declared_intent, operation)) return stale();
     // A rule or another scope can change the affected identities without editing the target override itself.
     try {
       const preview = backend.applyOperationToDocument(live, operation);
-      const impact = evaluateTargetedBlastRadius(live, preview, operation.flag_name, this.#roster);
+      const impact = evaluateTargetedImpact(live, preview, operation.flag_name, this.#roster);
       if (!isDeepStrictEqual(targetState(preview, operation), expected_after_state)
-        || !isDeepStrictEqual(impact, blast_radius)
-        || !isDeepStrictEqual(this.#approvalReasons(operation, impact), reasons)) return stale();
+        || !isDeepStrictEqual(impact.blast_radius, blast_radius)
+        || impact.affected_identities_digest !== affected_identities_digest
+        || !isDeepStrictEqual(this.#approvalReasons(operation, impact.blast_radius), reasons)) return stale();
     } catch (error) {
       if (error instanceof FlagsmithError) return stale();
       throw error;
@@ -355,6 +362,9 @@ export class GuardEngine {
         const snapshot_commit = this.#snapshots.commitSnapshot({ ...request, roster_version, document: live });
         this.#append(request, { status: 'reconciled_applied', snapshot_commit }, history.latest.status);
         return { ...request, status: 'reconciled_applied', snapshot_commit };
+      }
+      if (history.latest.status === 'verified') {
+        return { ...request, status: 'write_unconfirmed', code: 'VERIFIED_DRIFT_MISMATCH' };
       }
       if (isDeepStrictEqual(actual, write.target_baseline_state)) {
         this.#append(request, { status: 'reconciled_not_applied' }, history.latest.status);

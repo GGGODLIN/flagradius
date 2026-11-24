@@ -7,7 +7,7 @@ import { createFlagEvaluator, evaluateTargetedBlastRadius } from './evaluator.js
 import type { FlagsmithBackend, GuardProposal } from './guard-engine.js';
 import { recordObject } from './receipt-store.js';
 import type { EnvironmentSnapshot } from './snapshot-store.js';
-import { FlagsmithError } from './types.js';
+import { FlagsmithError, isFlagValue } from './types.js';
 import type { BlastRadiusResult, EnvironmentDocument, FeatureState, FlagValue, FlagWriteOperation, ModeTag, RosterEntry, SegmentRule } from './types.js';
 
 const exec = promisify(execFile);
@@ -80,8 +80,19 @@ interface Incident {
   after: ReplayFrame & { evaluation: DiagnosisEvaluation };
 }
 
-export function isDiagnosisValue(value: unknown): value is FlagValue {
-  return value === null || typeof value === 'string' || typeof value === 'boolean' || Number.isFinite(value);
+function hasBucketingKey(key: unknown): key is string {
+  return typeof key === 'string' && key !== '' && key !== '[REDACTED]';
+}
+
+function hydrateSnapshot(doc: EnvironmentDocument, live: EnvironmentDocument): EnvironmentDocument {
+  if (doc.api_key === '[REDACTED]' && doc.id === live.id && doc.project?.id === live.project?.id && hasBucketingKey(live.api_key)) {
+    return { ...doc, api_key: live.api_key };
+  }
+  return doc;
+}
+
+function hasPercentageSplit(rule: SegmentRule): boolean {
+  return rule.conditions.some(condition => condition.operator === 'PERCENTAGE_SPLIT') || rule.rules.some(hasPercentageSplit);
 }
 
 function cutoffTime(options: DiagnoseTimelineOptions): number {
@@ -168,9 +179,9 @@ function flagInputs(doc: EnvironmentDocument, flag: string, entry: RosterEntry) 
   const states = [...defaults, ...identityStates, ...segments.flatMap(segment => segment.states)];
   if (defaults.length !== 1 || identityStates.length > 1 || segments.some(segment => segment.states.length > 1)
     || states.some(state => !Number.isSafeInteger(state.feature.id) || !['STANDARD', 'MULTIVARIATE'].includes(state.feature.type)
-      || typeof state.enabled !== 'boolean' || !isDiagnosisValue(state.feature_state_value))) return null;
+      || typeof state.enabled !== 'boolean' || !isFlagValue(state.feature_state_value))) return null;
   const storedTraits = identity?.identity_traits ?? [];
-  if (!Array.isArray(storedTraits) || storedTraits.some(trait => !trait || typeof trait.trait_key !== 'string' || !isDiagnosisValue(trait.trait_value))) return null;
+  if (!Array.isArray(storedTraits) || storedTraits.some(trait => !trait || typeof trait.trait_key !== 'string' || !isFlagValue(trait.trait_value))) return null;
   const traits = new Set([...storedTraits.map(trait => trait.trait_key), ...Object.keys(entry.traits)]);
   if (identityStates.length === 0 && segments.some(segment => !Array.isArray(segment.rules) || segment.rules.some(rule => !validRule(rule, traits)))) return null;
   return {
@@ -181,12 +192,18 @@ function flagInputs(doc: EnvironmentDocument, flag: string, entry: RosterEntry) 
 }
 
 function evaluate(doc: EnvironmentDocument, flag: string, entry?: RosterEntry) {
-  if (!entry || !recordObject(entry.traits) || !Object.values(entry.traits).every(isDiagnosisValue)) return null;
+  if (!entry || !recordObject(entry.traits) || !Object.values(entry.traits).every(isFlagValue)) return null;
   try {
     const inputs = flagInputs(doc, flag, entry);
     if (!inputs) return null;
+    if (!hasBucketingKey(doc.api_key)) {
+      const { defaults, identityStates, segments } = inputs;
+      const activeStates = identityStates.length ? identityStates : [...defaults, ...segments.flatMap(segment => segment.states)];
+      if (activeStates.some(state => state.multivariate_feature_state_values?.length)
+        || (identityStates.length === 0 && segments.some(segment => segment.rules.some(hasPercentageSplit)))) return null;
+    }
     const result = createFlagEvaluator(doc, flag)(entry);
-    return isDiagnosisValue(result.value) ? { inputs, result } : null;
+    return isFlagValue(result.value) ? { inputs, result } : null;
   } catch (error) {
     if (error instanceof FlagsmithError || error instanceof TypeError) return null;
     throw error;
@@ -263,8 +280,13 @@ function compareRecovery(
   const after = incident.after.evaluation;
   const enabledChanged = before.enabled !== after.enabled;
   const valueChanged = before.value !== after.value;
-  if ((!enabledChanged || current.enabled !== after.enabled) && (!valueChanged || current.value !== after.value)) return [];
-  const desired = { enabled: enabledChanged ? before.enabled : current.enabled, value: valueChanged ? before.value : current.value };
+  const restoreEnabled = enabledChanged && current.enabled === after.enabled;
+  const restoreValue = valueChanged && current.value === after.value;
+  if (!restoreEnabled && !restoreValue) return [];
+  const desired = {
+    enabled: restoreEnabled ? before.enabled : current.enabled,
+    value: restoreValue ? before.value : current.value,
+  };
   const candidates: DiagnosisCandidate[] = [];
   const preview = (kind: DiagnosisCandidate['kind'], proposal: GuardProposal) => {
     const { operation } = proposal;
@@ -297,6 +319,7 @@ export async function diagnoseTimeline(options: DiagnoseTimelineOptions): Promis
   const { backend, environment, flag, identity, roster, roster_version } = options;
   const cutoff = cutoffTime(options);
   const { commits, read } = await snapshotHistory(options);
+  const live = await backend.fetchEnvironmentDocument();
   const entry = roster.find(entry => entry.identifier === identity);
   const transitions: TimelineTransition[] = [];
   let previous: ReplayFrame | undefined;
@@ -309,7 +332,8 @@ export async function diagnoseTimeline(options: DiagnoseTimelineOptions): Promis
     const next = commits[index + 1];
     if (!inWindow && commit !== head && (!next || next.timestamp < cutoff)) continue;
     const snapshot = await read(commit.sha);
-    const evaluation = snapshot.roster_version === roster_version ? evaluate(snapshot.document, flag, entry)?.result ?? null : null;
+    const evaluation = snapshot.roster_version === roster_version
+      ? evaluate(hydrateSnapshot(snapshot.document, live), flag, entry)?.result ?? null : null;
     if (inWindow) {
       snapshots_replayed++;
       if (!evaluation || (previous && !previous.evaluation)) incomplete = true;
@@ -327,9 +351,8 @@ export async function diagnoseTimeline(options: DiagnoseTimelineOptions): Promis
   }
 
   const recorded = previous!.snapshot;
-  const live = await backend.fetchEnvironmentDocument();
   const current = evaluate(live, flag, entry);
-  const offline = evaluate(recorded.document, flag, entry);
+  const offline = evaluate(hydrateSnapshot(recorded.document, live), flag, entry);
   const snapshot_gap = !isDeepStrictEqual(withoutCredentials(recorded.document), withoutCredentials(live));
   const expectedTraits = (current && entry) ? Object.fromEntries(Object.entries({
     ...Object.fromEntries(current.inputs.storedTraits.map(trait => [trait.trait_key, trait.trait_value])), ...entry.traits,

@@ -67,7 +67,7 @@ async function pendingUrl() {
 }
 
 describe('split-privilege MCP and human approval', () => {
-  it('boots a credential-free MCP toolset and rejects the proposal token on both decision routes', async () => {
+  it('exposes only three MCP tools and rejects the proposal token on both decision routes', async () => {
     const tools = (await client.listTools()).tools.map(({ name }) => name);
     expect(tools.sort()).toEqual(['diagnose_flag_incident', 'inspect_flags', 'propose_flag_change']);
 
@@ -120,10 +120,12 @@ describe('split-privilege MCP and human approval', () => {
     expect(diagnosis.structuredContent).toMatchObject({
       mode, status: 'diagnosed', snapshot_gap: true, alignment: 'aligned', candidates: [{ segment_id: 12, name: 'internal_testers' }],
     });
-    const optedIn = await client.callTool({ name: 'diagnose_flag_incident', arguments: { ...query, echo_identifier: true } });
-    expect(payload(optedIn)?.identifier).toBe(query.identifier);
-    expect(JSON.stringify(diagnosis).includes(query.identifier)).toBe(false);
-    expect(JSON.stringify(optedIn).includes(roster[0].identifier)).toBe(false);
+    const legacyOptIn = await client.callTool({ name: 'diagnose_flag_incident', arguments: { ...query, echo_identifier: true } });
+    expect(legacyOptIn.structuredContent).toMatchObject({ status: 'error', code: 'INVALID_ARGUMENTS' });
+    for (const response of [diagnosis, legacyOptIn]) {
+      expect(JSON.stringify(response.structuredContent).includes(query.identifier)).toBe(false);
+      expect(JSON.stringify(response.content).includes(query.identifier)).toBe(false);
+    }
     expect(fixture.backend.writes).toHaveLength(0);
   });
 
@@ -142,10 +144,79 @@ describe('split-privilege MCP and human approval', () => {
     for (const field of [
       'Impact Approval Card', environment, flagName.replace('<&', '&lt;&amp;'), segmentName.replace('<&', '&lt;&amp;'),
       '+ON 2', '-OFF 0', '~value_changed 0', 'Evaluated roster', '>3<', 'VIP hits', '>1<', 'VIP_IMPACT',
-      'Baseline revision', String(payload(pending)?.request_id), mode, 'overflow-wrap: anywhere',
+      'Baseline revision', mode, 'overflow-wrap: anywhere',
       '/approve"', '/reject"', '>Approve</button>', '>Reject</button>',
     ]) expect(html).toContain(field);
     expect(html.includes(flagName)).toBe(false);
+  });
+
+  it('shows the same Approval Card revision for the same baseline and changes it after drift', async () => {
+    const proposeAndRead = async () => {
+      const pending = await fixture.engine.proposeChange({ environment, declared_intent: 'everyone',
+        operation: { type: 'set_environment_default', flag_name: flag, enabled: true },
+      });
+      if (pending.status !== 'pending_approval') throw new Error('Expected a pending card');
+      const url = `${daemon.origin}/approvals/${pending.card.id}`;
+      const html = await (await fetch(url, { headers: auth(humanApprovalToken) })).text();
+      const { baseline_revision: revision } = pending.card;
+      expect(revision).toMatch(/^rev-[a-f0-9]{12}$/);
+      expect(revision).not.toBe(pending.request_id);
+      expect(html).toContain(`<dt>Baseline revision</dt><dd>${revision}</dd>`);
+      expect(pending.card).not.toHaveProperty('affected_identities_digest');
+      return { revision, requestId: pending.request_id };
+    };
+    const featureState = fixture.backend.live.feature_states[0];
+    featureState.multivariate_feature_state_values = [
+      { id: 1, percentage_allocation: 50, multivariate_feature_option: { id: 4_294_967_296, value: 'A' } },
+      { id: 2, percentage_allocation: 50, multivariate_feature_option: { id: 4_294_967_297, value: 'B' } },
+    ];
+    const first = await proposeAndRead();
+    featureState.multivariate_feature_state_values.reverse();
+    const second = await proposeAndRead();
+    expect(second.requestId).not.toBe(first.requestId);
+    expect(second.revision).toBe(first.revision);
+    fixture.backend.live.feature_states[0].feature_state_value = 'out-of-band baseline';
+    const third = await proposeAndRead();
+    expect(third.revision).not.toBe(first.revision);
+  });
+
+  it.each(['JSON bearer', 'form'] as const)('reconciles a crash lock only with human authentication (%s)', async transport => {
+    const crashOperation = { type: 'set_identity_override', flag_name: flag, identifier: roster[0].identifier, enabled: true } as const;
+    const crashProposal = { environment, declared_intent: crashOperation.identifier, operation: crashOperation };
+    const applied = transport === 'form';
+    fixture.backend.onExecute = operation => {
+      if (applied) fixture.backend.live = fixture.backend.applyOperationToDocument(fixture.backend.live, operation);
+      throw new Error('Simulated interruption');
+    };
+    const interrupted = await fixture.engine.proposeChange(crashProposal);
+    expect(interrupted).toMatchObject({ status: 'write_unconfirmed' });
+    const post = (token: string, target: unknown = environment, formToken?: string) => fetch(`${daemon.origin}/admin/reconcile`, {
+      method: 'POST', ...(transport === 'JSON bearer'
+        ? { headers: { ...auth(token), 'content-type': 'application/json' }, body: JSON.stringify({ environment: target }) }
+        : { headers: formToken ? auth(token) : undefined, body: new URLSearchParams({ token: formToken ?? token, environment: String(target) }) }),
+    });
+    const denied = await post(proposalToken);
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toMatchObject({ code: 'EXECUTOR_FORBIDDEN' });
+    if (transport === 'form') {
+      for (const tokens of [[proposalToken, humanApprovalToken], [humanApprovalToken, proposalToken]] as const) {
+        const mixed = await post(tokens[0], environment, tokens[1]);
+        expect(mixed.status).toBe(403);
+        expect(await mixed.json()).toMatchObject({ code: 'EXECUTOR_FORBIDDEN' });
+      }
+    }
+    const invalid = await post(humanApprovalToken, transport === 'JSON bearer' ? 123 : ' ');
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({ code: 'INVALID_ARGUMENTS' });
+    expect(await fixture.engine.proposeChange(crashProposal)).toMatchObject({ code: 'ENV_CRASH_LOCKED' });
+    const reconciled = await post(humanApprovalToken);
+    expect(reconciled.status).toBe(200);
+    expect(await reconciled.json()).toEqual({ mode, request_id: interrupted.request_id, environment,
+      ...(applied ? { status: 'reconciled_applied', snapshot_commit: expect.stringMatching(/^[0-9a-f]+$/) } : { status: 'reconciled_not_applied' }),
+    });
+    expect(fixture.backend.writes).toHaveLength(1);
+    fixture.backend.onExecute = undefined;
+    expect(await fixture.engine.proposeChange(crashProposal)).toMatchObject({ status: 'snapshotted' });
   });
 
   it('executes once per card and shows already_approved, rejected and stale_approval', async () => {

@@ -1,14 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { isDeepStrictEqual, parseArgs } from 'node:util';
-import { FlagsmithAdapter } from './flagsmith-adapter.js';
+import { FlagsmithAdapter, validateEnvironmentDocument } from './flagsmith-adapter.js';
 import type { FlagsmithAdapterOptions } from './flagsmith-adapter.js';
 import { recordObject } from './receipt-store.js';
+import { loadRosterFile } from './roster.js';
 import { SnapshotStore } from './snapshot-store.js';
-import { diagnoseTimeline, formatDiagnosisReport, isDiagnosisValue } from './timeline-diagnose.js';
+import { diagnoseTimeline, formatDiagnosisReport } from './timeline-diagnose.js';
 import type { DiagnoseTimelineOptions } from './timeline-diagnose.js';
-import { FlagsmithError } from './types.js';
-import type { EnvironmentDocument, FlagValue, ModeTag, RosterEntry } from './types.js';
+import { FlagsmithError, isFlagValue } from './types.js';
+import type { FlagValue, ModeTag } from './types.js';
 
 type DiagnosisQuery = Pick<DiagnoseTimelineOptions, 'environment' | 'flag' | 'identity' | 'since'>;
 export type DiagnosisSources = Omit<DiagnoseTimelineOptions, keyof DiagnosisQuery>;
@@ -36,7 +37,7 @@ export function createLiveEvaluationReader(options: FlagsmithAdapterOptions): No
     }
     if (!recordObject(payload) || !Array.isArray(payload.flags)) return null;
     const result = payload.flags.find(state => recordObject(state) && recordObject(state.feature) && state.feature.name === flag);
-    if (!recordObject(result) || typeof result.enabled !== 'boolean' || !isDiagnosisValue(result.feature_state_value)) return null;
+    if (!recordObject(result) || typeof result.enabled !== 'boolean' || !isFlagValue(result.feature_state_value)) return null;
     const inputs_aligned = Array.isArray(payload.traits) && payload.traits.every(validTrait)
       && isDeepStrictEqual(Object.fromEntries(payload.traits.filter(trait => trait.trait_value !== null)
         .map(trait => [trait.trait_key, trait.trait_value])), expectedTraits);
@@ -45,12 +46,7 @@ export function createLiveEvaluationReader(options: FlagsmithAdapterOptions): No
 }
 
 function validTrait(value: unknown): value is { trait_key: string; trait_value: FlagValue } {
-  return recordObject(value) && typeof value.trait_key === 'string' && isDiagnosisValue(value.trait_value);
-}
-
-function rosterEntry(value: unknown): value is RosterEntry {
-  return recordObject(value) && typeof value.identifier === 'string' && value.identifier.trim() !== '' && typeof value.vip === 'boolean'
-    && recordObject(value.traits) && Object.values(value.traits).every(isDiagnosisValue);
+  return recordObject(value) && typeof value.trait_key === 'string' && isFlagValue(value.trait_value);
 }
 
 function configuredMode(): ModeTag {
@@ -63,19 +59,7 @@ async function loadSources(environment: string): Promise<DiagnosisSources> {
   if (environment !== (env.FLAGRADIUS_ENVIRONMENT ?? 'sandbox')) {
     throw new FlagsmithError(mode, 'ENV_NOT_ALLOWED', 'The requested environment is not configured for diagnosis.');
   }
-  let roster: RosterEntry[];
-  let roster_version: string;
-  try {
-    const config: unknown = JSON.parse(await readFile(env.FLAGRADIUS_ROSTER_PATH ?? 'roster.json', 'utf8'));
-    const entries: unknown = recordObject(config) ? config.roster : config;
-    const version: unknown = recordObject(config) ? config.roster_version : env.FLAGRADIUS_ROSTER_VERSION;
-    if (!Array.isArray(entries) || !entries.every(rosterEntry) || typeof version !== 'string' || !version.trim()
-      || new Set(entries.map(entry => entry.identifier)).size !== entries.length) throw new Error();
-    roster = entries;
-    roster_version = version;
-  } catch {
-    throw new FlagsmithError(mode, 'INVALID_ROSTER', 'A readable roster.json with valid identities and a roster version is required.');
-  }
+  const { roster, roster_version } = await loadRosterFile(env.FLAGRADIUS_ROSTER_PATH ?? 'roster.json', mode, env.FLAGRADIUS_ROSTER_VERSION);
   const snapshotDirectory = new SnapshotStore(env.FLAGRADIUS_SNAPSHOT_DIRECTORY).directory;
   const options: FlagsmithAdapterOptions = {
     apiUrl: env.FLAGSMITH_API_URL ?? '', projectId: Number(env.FLAGSMITH_PROJECT_ID),
@@ -91,8 +75,7 @@ async function loadSources(environment: string): Promise<DiagnosisSources> {
     async fetchEnvironmentDocument() {
       try {
         const doc: unknown = JSON.parse(await readFile(fixturePath, 'utf8'));
-        if (!recordObject(doc)) throw new Error();
-        return doc as unknown as EnvironmentDocument;
+        return validateEnvironmentDocument(doc, mode);
       } catch {
         throw new FlagsmithError(mode, 'INVALID_DOCUMENT', 'The configured offline fixture is not a readable environment document.');
       }

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { EnvironmentModel, IdentityModel } from '@flagsmith/nodejs';
 import { FlagsmithError } from './types.js';
 import type { BlastRadiusResult, EnvironmentDocument, FeatureState, FlagValue, RosterEntry, SegmentRule } from './types.js';
@@ -37,7 +38,12 @@ function normalizeState(state: FeatureState, scopeKey: string): FeatureState {
   return {
     ...state,
     ...(stableUuid !== undefined ? { featurestate_uuid: stableUuid } : {}),
-    multivariate_feature_state_values: state.multivariate_feature_state_values ?? [],
+    multivariate_feature_state_values: (state.multivariate_feature_state_values ?? []).map((variant, index) => {
+      if (variant.id != null || variant.mv_fs_value_uuid) return variant;
+      const seed = `stable-mv:${scopeKey}:${state.feature.id}:${index}:${String(variant.multivariate_feature_option?.value ?? '')}`;
+      // The SDK parses variant UUIDs as hexadecimal integers to determine rollout ordering.
+      return { ...variant, mv_fs_value_uuid: createHash('sha256').update(seed).digest('hex').slice(0, 32) };
+    }),
   };
 }
 
@@ -92,13 +98,14 @@ export function createFlagEvaluator(doc: EnvironmentDocument, flagName: string):
   }
 }
 
-export function evaluateTargetedBlastRadius(beforeDoc: EnvironmentDocument, afterDoc: EnvironmentDocument, flagName: string, roster: readonly RosterEntry[]): BlastRadiusResult {
+export function evaluateTargetedImpact(beforeDoc: EnvironmentDocument, afterDoc: EnvironmentDocument, flagName: string, roster: readonly RosterEntry[]) {
   const before = createFlagEvaluator(beforeDoc, flagName);
   const after = createFlagEvaluator(afterDoc, flagName);
   let flipped_on = 0;
   let flipped_off = 0;
   let value_changed = 0;
   let vip_hits = 0;
+  const affected: string[] = [];
   for (const entry of roster) {
     const previous = before(entry);
     const next = after(entry);
@@ -111,6 +118,13 @@ export function evaluateTargetedBlastRadius(beforeDoc: EnvironmentDocument, afte
       continue;
     }
     if (entry.vip) vip_hits++;
+    affected.push(JSON.stringify([entry.identifier, previous.enabled, previous.value, next.enabled, next.value]));
   }
-  return { total_evaluated: roster.length, total_flipped: flipped_on + flipped_off + value_changed, flipped_on, flipped_off, value_changed, vip_hits };
+  const blast_radius: BlastRadiusResult = { total_evaluated: roster.length, total_flipped: affected.length, flipped_on, flipped_off, value_changed, vip_hits };
+  const affected_identities_digest = createHash('sha256').update(affected.sort().join('\n')).digest('hex');
+  return { blast_radius, affected_identities_digest };
+}
+
+export function evaluateTargetedBlastRadius(beforeDoc: EnvironmentDocument, afterDoc: EnvironmentDocument, flagName: string, roster: readonly RosterEntry[]): BlastRadiusResult {
+  return evaluateTargetedImpact(beforeDoc, afterDoc, flagName, roster).blast_radius;
 }

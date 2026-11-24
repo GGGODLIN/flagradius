@@ -7,11 +7,11 @@ import type { ModeTag } from './types.js';
 const modeSchema = z.enum(['LIVE_FLAGSMITH', 'OFFLINE_FIXTURE_REPLAY']);
 const codeSchema = z.enum([
   'APPROVAL_NOT_FOUND', 'BACKEND_MODE_CHANGED', 'BASELINE_UNAVAILABLE', 'BLOCKED_INTENT_MISMATCH',
-  'CROSS_ENV_LOCKED', 'DIAGNOSIS_UNAVAILABLE', 'ENV_CRASH_LOCKED', 'ENV_NOT_ALLOWED',
+  'CORRUPT_SNAPSHOT', 'CROSS_ENV_LOCKED', 'DIAGNOSIS_UNAVAILABLE', 'ENV_CRASH_LOCKED', 'ENV_NOT_ALLOWED',
   'EXECUTOR_ERROR', 'EXECUTOR_FORBIDDEN', 'EXECUTOR_UNAVAILABLE', 'INVALID_ARGUMENTS', 'INVALID_CONFIGURATION',
-  'INVALID_DOCUMENT', 'INVALID_PROPOSAL', 'INVALID_WRITE_OPERATION', 'LIVE_CLI_FAILED', 'LIVE_HTTP_ERROR',
-  'LIVE_UNAVAILABLE', 'NEEDS_DISAMBIGUATION', 'OVER_BUDGET', 'PROTECTED_FLAG', 'READBACK_MISMATCH',
-  'UNSUPPORTED_FLAG_DEPENDENCY', 'VIP_IMPACT', 'WRITE_UNCONFIRMED',
+  'INVALID_DIAGNOSIS_QUERY', 'INVALID_DOCUMENT', 'INVALID_PROPOSAL', 'INVALID_WRITE_OPERATION', 'LIVE_CLI_FAILED', 'LIVE_EVALUATION_UNAVAILABLE', 'LIVE_HTTP_ERROR',
+  'LIVE_UNAVAILABLE', 'NEEDS_DISAMBIGUATION', 'OVER_BUDGET', 'PROTECTED_FLAG', 'READBACK_MISMATCH', 'SNAPSHOT_NOT_FOUND', 'SNAPSHOT_REPOSITORY_UNAVAILABLE',
+  'UNKNOWN_IDENTITY', 'UNSUPPORTED_FLAG_DEPENDENCY', 'VIP_IMPACT', 'WRITE_UNCONFIRMED',
 ]);
 const statusSchema = z.enum([
   'inspected', 'diagnosed', 'error', 'blocked', 'needs_disambiguation', 'pending_approval',
@@ -38,7 +38,7 @@ const payloadSchema = z.object({
   snapshot_gap: z.boolean().optional().catch(undefined),
   alignment: z.enum(['aligned', 'evaluation_mismatch', 'inputs_not_aligned']).optional().catch(undefined),
   candidate_fixes: z.array(z.object({
-    type: z.enum(['set_identity_override', 'delete_identity_override', 'set_segment_override', 'delete_segment_override']),
+    type: z.enum(['set_identity_override', 'delete_identity_override', 'set_segment_override', 'delete_segment_override', 'set_environment_default']),
     segment_id: z.int().positive().optional().catch(undefined),
     blast_radius: countsSchema,
   })).optional().catch(undefined),
@@ -68,9 +68,8 @@ interface McpGuardOptions {
   mode?: ModeTag;
 }
 
-const argument = (type: 'string' | 'object' | 'boolean', description: string) => z.unknown().optional().meta({ type, description });
+const argument = (type: 'string' | 'object', description: string) => z.unknown().optional().meta({ type, description });
 const environment = argument('string', 'Configured environment alias.');
-const nonblank = z.string().refine(value => !!value.trim());
 
 export async function startMcpGuard(options: McpGuardOptions): Promise<McpServer> {
   if (Object.hasOwn(process.env, 'FLAGSMITH_API_TOKEN') || Object.hasOwn(process.env, 'FLAGRADIUS_HUMAN_APPROVAL_TOKEN')) {
@@ -84,10 +83,8 @@ export async function startMcpGuard(options: McpGuardOptions): Promise<McpServer
   const shutdown = new AbortController();
   const server = new McpServer({ name: 'flagradius-mcp-guard', version: '0.1.0' });
 
-  function toolResult(input: unknown, echoIdentifier?: string) {
-    const redacted = redactMcpPayload(input, fallbackMode, origin);
-    const payload = redacted.status === 'diagnosed' && echoIdentifier !== undefined
-      ? { ...redacted, identifier: echoIdentifier } : redacted;
+  function toolResult(input: unknown) {
+    const payload = redactMcpPayload(input, fallbackMode, origin);
     return {
       content: [{ type: 'text' as const, text: JSON.stringify(payload) }],
       structuredContent: payload,
@@ -95,14 +92,14 @@ export async function startMcpGuard(options: McpGuardOptions): Promise<McpServer
     };
   }
 
-  async function callExecutor(path: string, input: Record<string, unknown>, signal: AbortSignal, echoIdentifier?: string) {
+  async function callExecutor(path: string, input: Record<string, unknown>, signal: AbortSignal) {
     try {
       const response = await fetch(`${origin}/api/${path}`, {
         method: 'POST', redirect: 'error',
         headers: { authorization: `Bearer ${options.proposalToken}`, 'content-type': 'application/json' },
         body: JSON.stringify(input), signal: AbortSignal.any([shutdown.signal, signal, AbortSignal.timeout(30_000)]),
       });
-      return toolResult(await response.json(), echoIdentifier);
+      return toolResult(await response.json());
     } catch {
       return toolResult({ status: 'error', code: 'EXECUTOR_UNAVAILABLE' });
     }
@@ -125,13 +122,9 @@ export async function startMcpGuard(options: McpGuardOptions): Promise<McpServer
     description: 'Investigate a flag incident for one identity using read-only snapshot timeline data.',
     inputSchema: z.looseObject({
       environment, flag_name: argument('string', 'Flag name.'), identifier: argument('string', 'Identity to investigate.'),
-      since: argument('string', 'Optional timeline window.'), echo_identifier: argument('boolean', 'Set to true to include the query identity in the response.'),
+      since: argument('string', 'Optional timeline window.'),
     }).meta({ required: ['environment', 'flag_name', 'identifier'] }), annotations: { readOnlyHint: true },
-  }, ({ echo_identifier, ...args }, { signal }) => {
-    if (echo_identifier !== undefined && typeof echo_identifier !== 'boolean') return toolResult({ status: 'error', code: 'INVALID_ARGUMENTS' });
-    const identifier = nonblank.safeParse(args.identifier);
-    return callExecutor('diagnose', args, signal, echo_identifier === true && identifier.success ? identifier.data : undefined);
-  });
+  }, (args, { signal }) => callExecutor('diagnose', args, signal));
 
   const stop = () => {
     shutdown.abort();

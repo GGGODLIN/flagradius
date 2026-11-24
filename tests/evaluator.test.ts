@@ -69,6 +69,18 @@ test('reports zero flips deterministically for an identical 50/50 multivariate d
   }
 });
 
+test('reports zero flips for identical multivariate documents with no variant IDs or UUIDs', () => {
+  const doc = document(true);
+  doc.feature_states[0].multivariate_feature_state_values = [
+    { multivariate_feature_option: { id: 11, value: 'A' }, percentage_allocation: 50 },
+    { multivariate_feature_option: { id: 12, value: 'B' }, percentage_allocation: 50 },
+  ];
+  const identical = structuredClone(doc);
+  for (let i = 0; i < 64; i++) {
+    expect(evaluateTargetedBlastRadius(doc, identical, flag, roster).total_flipped).toBe(0);
+  }
+});
+
 test('rejects a missing target instead of reporting a zero blast radius', () => {
   const before = document();
   const invalid = document();

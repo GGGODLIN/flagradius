@@ -6,13 +6,15 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import { renderApprovalPage } from './approval-ui.js';
 import type { ApprovalComparison } from './approval-ui.js';
+import { createLiveEvaluationReader } from './diagnose-cli.js';
 import { FlagsmithAdapter } from './flagsmith-adapter.js';
 import { GuardEngine } from './guard-engine.js';
 import type { ApprovalCard, FlagsmithBackend } from './guard-engine.js';
 import { redactMcpPayload } from './mcp-guard.js';
 import { ReceiptStore } from './receipt-store.js';
-import { generateRoster } from './roster.js';
+import { generateRoster, loadRosterFile } from './roster.js';
 import { SnapshotStore } from './snapshot-store.js';
+import { diagnoseTimeline } from './timeline-diagnose.js';
 import { FlagsmithError } from './types.js';
 import type { ModeTag } from './types.js';
 
@@ -83,7 +85,7 @@ function readCard(receiptStore: ReceiptStore, id: string) {
   const { operation } = plan;
   const card: ApprovalCard = {
     id, request_id: id, mode, environment, status: 'pending', flag_name: operation.flag_name,
-    target: operation.type, baseline_revision: id, blast_radius: plan.blast_radius,
+    target: operation.type, baseline_revision: plan.baseline_revision, blast_radius: plan.blast_radius,
     target_baseline_state: plan.target_baseline_state, reasons: plan.reasons,
     ...('segment_id' in operation && { segment_id: operation.segment_id }),
     ...('identifier' in operation && { identifier: operation.identifier }),
@@ -182,6 +184,29 @@ export async function startExecutorDaemon(options: ExecutorDaemonOptions) {
     return render({ status: 'pending', card, segmentName, token: humanApprovalToken, comparison: options.approvalComparison?.(card) });
   }
 
+  async function reconcile(request: IncomingMessage, response: ServerResponse) {
+    const hasAuthorization = request.headers.authorization !== undefined;
+    if (hasAuthorization && !matches(bearer(request), humanApprovalToken)) return failure(response, 403, 'EXECUTOR_FORBIDDEN');
+    const body = await readBody(request, 'application/x-www-form-urlencoded');
+    const form = body === undefined ? undefined : new URLSearchParams(body);
+    const tokens = form?.getAll('token') ?? [];
+    if ((!hasAuthorization || tokens.length > 0) && (tokens.length !== 1 || !matches(tokens[0], humanApprovalToken))) {
+      return failure(response, 403, 'EXECUTOR_FORBIDDEN');
+    }
+    const formEnvironments = form?.getAll('environment');
+    const input = formEnvironments === undefined ? await readJson(request)
+      : { environment: formEnvironments.length === 1 ? formEnvironments[0] : undefined };
+    const parsed = inspectQuery.safeParse(input);
+    if (!parsed.success) return failure(response, 400, 'INVALID_ARGUMENTS');
+
+    const result = await engine.reconcileEnvironment(parsed.data.environment);
+    const { status, mode, request_id, environment } = result;
+    return send(response, 200, JSON.stringify({ status, mode, request_id, environment,
+      ...('snapshot_commit' in result && { snapshot_commit: result.snapshot_commit }),
+      ...('code' in result && { code: result.code }),
+    }));
+  }
+
   async function route(request: IncomingMessage, response: ServerResponse) {
     if (request.headers.host !== host || (request.headers.origin !== undefined && request.headers.origin !== origin)) {
       return failure(response, 403, 'EXECUTOR_FORBIDDEN');
@@ -189,6 +214,7 @@ export async function startExecutorDaemon(options: ExecutorDaemonOptions) {
     if (request.method === 'POST' && (request.url === '/api/inspect' || request.url === '/api/propose' || request.url === '/api/diagnose')) {
       return api(request, response);
     }
+    if (request.method === 'POST' && request.url === '/admin/reconcile') return reconcile(request, response);
     const match = approvalRoute.exec(request.url ?? '');
     if (match && (request.method === 'POST' || (request.method === 'GET' && !match[2]))) {
       return approval(request, response, match[1], match[2]);
@@ -224,30 +250,58 @@ export async function startExecutorDaemon(options: ExecutorDaemonOptions) {
   return { origin, close };
 }
 
-async function runExecutor() {
-  const apiToken = process.env.FLAGSMITH_API_TOKEN ?? '';
-  const apiUrl = process.env.FLAGSMITH_API_URL ?? '';
-  const projectId = Number(process.env.FLAGSMITH_PROJECT_ID);
-  const environmentKey = process.env.FLAGSMITH_ENVIRONMENT_KEY ?? '';
-  const environment = process.env.FLAGRADIUS_ENVIRONMENT ?? 'sandbox';
-  const port = Number(process.env.FLAGRADIUS_EXECUTOR_PORT ?? '8788');
+export async function buildExecutorRuntime(env: NodeJS.ProcessEnv): Promise<ExecutorDaemonOptions> {
+  const apiToken = env.FLAGSMITH_API_TOKEN ?? '';
+  const apiUrl = env.FLAGSMITH_API_URL ?? '';
+  const projectId = Number(env.FLAGSMITH_PROJECT_ID);
+  const environmentKey = env.FLAGSMITH_ENVIRONMENT_KEY ?? '';
+  const environment = env.FLAGRADIUS_ENVIRONMENT ?? 'sandbox';
+  const port = Number(env.FLAGRADIUS_EXECUTOR_PORT ?? '8788');
   if (!apiToken.trim() || !apiUrl.trim() || !environmentKey.trim() || !environment.trim() || !Number.isSafeInteger(projectId) || projectId < 1
     || !Number.isInteger(port) || port < 0 || port > 65_535) throw new Error('Incomplete live executor configuration.');
 
-  const stateDir = process.env.FLAGRADIUS_STATE_DIR ?? '.flagradius-state';
+  const { roster, roster_version } = env.FLAGRADIUS_ROSTER_PATH === undefined
+    ? { roster: generateRoster(), roster_version: env.FLAGRADIUS_ROSTER_VERSION ?? 'synthetic-v1' }
+    : await loadRosterFile(env.FLAGRADIUS_ROSTER_PATH, 'LIVE_FLAGSMITH', env.FLAGRADIUS_ROSTER_VERSION);
+  const protected_flags = env.FLAGRADIUS_PROTECTED_FLAGS?.split(',').map(name => name.trim()).filter(Boolean);
+  const limit = env.FLAGRADIUS_MAX_SINGLE_AUTO_FLIPS?.trim();
+  const max_single_auto_flips = limit === undefined ? undefined : Number(limit);
+  if (limit !== undefined && (!/^\d+$/.test(limit) || !Number.isSafeInteger(max_single_auto_flips))) {
+    throw new FlagsmithError('LIVE_FLAGSMITH', 'INVALID_CONFIGURATION', 'The maximum automatic flip count must be a non-negative safe integer.');
+  }
+  const stateDir = env.FLAGRADIUS_STATE_DIR ?? '.flagradius-state';
   const receiptStore = new ReceiptStore(join(stateDir, 'receipts.jsonl'));
   const snapshotStore = new SnapshotStore(join(stateDir, 'snapshots'));
-  const environments = { [environment]: new FlagsmithAdapter({ apiUrl, projectId, environmentKey, apiToken }) };
-  const engine = new GuardEngine({ environments, roster: generateRoster(), roster_version: 'synthetic-v1', receiptStore, snapshotStore });
-  const { origin } = await startExecutorDaemon({
-    engine, receiptStore, environments, port, handleSignals: true,
-    proposalToken: process.env.FLAGRADIUS_PROPOSAL_TOKEN ?? '',
-    humanApprovalToken: process.env.FLAGRADIUS_HUMAN_APPROVAL_TOKEN ?? '',
-  });
+  const adapterOptions = { apiUrl, projectId, environmentKey, apiToken };
+  const environments = { [environment]: new FlagsmithAdapter(adapterOptions) };
+  const engine = new GuardEngine({ environments, roster, roster_version, max_single_auto_flips, protected_flags, receiptStore, snapshotStore });
+  const readLiveEvaluation = createLiveEvaluationReader(adapterOptions);
+  return {
+    engine, receiptStore, environments, port,
+    async onDiagnose(query) {
+      const diagnosis = await diagnoseTimeline({
+        environment: query.environment, flag: query.flag_name, identity: query.identifier, since: query.since,
+        snapshotDirectory: snapshotStore.directory, roster, roster_version, backend: environments[query.environment], readLiveEvaluation,
+      });
+      return {
+        alignment: diagnosis.parity.verdict, snapshot_gap: diagnosis.snapshot_gap,
+        candidate_fixes: diagnosis.candidates.map(({ proposal: { operation }, blast_radius }) => ({
+          type: operation.type, ...('segment_id' in operation && { segment_id: operation.segment_id }), blast_radius,
+        })),
+      };
+    },
+    proposalToken: env.FLAGRADIUS_PROPOSAL_TOKEN ?? '',
+    humanApprovalToken: env.FLAGRADIUS_HUMAN_APPROVAL_TOKEN ?? '',
+  };
+}
+
+async function runExecutor() {
+  const { origin } = await startExecutorDaemon({ ...await buildExecutorRuntime(process.env), handleSignals: true });
   console.log(JSON.stringify({ status: 'listening', mode: 'LIVE_FLAGSMITH', origin }));
 }
 
-if (import.meta.main) await runExecutor().catch(() => {
-  console.error(JSON.stringify({ status: 'error', code: 'EXECUTOR_STARTUP_FAILED', mode: 'LIVE_FLAGSMITH' }));
+if (import.meta.main) await runExecutor().catch((error: unknown) => {
+  const code = error instanceof FlagsmithError ? error.code : 'EXECUTOR_STARTUP_FAILED';
+  console.error(JSON.stringify({ status: 'error', code, mode: 'LIVE_FLAGSMITH' }));
   process.exitCode = 1;
 });

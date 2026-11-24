@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import { dirname } from 'node:path';
 import { validateOperation } from './flagsmith-adapter.js';
+import { isFlagValue } from './types.js';
 import type { BlastRadiusResult, FlagValue, FlagWriteOperation, ModeTag } from './types.js';
 
 export const ALLOWED_RECEIPT_TRANSITIONS = {
@@ -10,7 +11,7 @@ export const ALLOWED_RECEIPT_TRANSITIONS = {
   pending_approval: ['write_attempted', 'rejected', 'stale_approval'],
   write_attempted: ['verified', 'write_unconfirmed', 'reconciled_applied', 'reconciled_not_applied'],
   write_unconfirmed: ['reconciled_applied', 'reconciled_not_applied'],
-  verified: ['snapshotted', 'reconciled_applied', 'reconciled_not_applied'],
+  verified: ['snapshotted', 'reconciled_applied'],
   blocked: [],
   needs_disambiguation: [],
   rejected: [],
@@ -21,7 +22,7 @@ export const ALLOWED_RECEIPT_TRANSITIONS = {
 } as const;
 
 export type ReceiptStatus = keyof typeof ALLOWED_RECEIPT_TRANSITIONS;
-export type ApprovalReason = 'OVER_BUDGET' | 'VIP_IMPACT' | 'PROTECTED_FLAG';
+export type ApprovalReason = 'OVER_BUDGET' | 'VIP_IMPACT' | 'PROTECTED_FLAG' | 'UNKNOWN_IDENTITY';
 
 export interface RequestMetadata {
   mode: ModeTag;
@@ -46,6 +47,8 @@ export interface WriteContext {
 
 export interface ApprovalPlan extends WriteContext {
   declared_intent: string;
+  affected_identities_digest: string;
+  baseline_revision: string;
   blast_radius: BlastRadiusResult;
   reasons: ApprovalReason[];
   roster_version: string;
@@ -71,15 +74,11 @@ export function recordObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function flagValue(value: unknown): value is FlagValue {
-  return value === null || typeof value === 'string' || typeof value === 'boolean' || Number.isFinite(value);
-}
-
 function targetState(value: unknown): value is TargetState | null {
   if (value === null) return true;
-  return recordObject(value) && typeof value.enabled === 'boolean' && flagValue(value.value)
+  return recordObject(value) && typeof value.enabled === 'boolean' && isFlagValue(value.value)
     && (value.priority === null || Number.isFinite(value.priority)) && recordObject(value.weights)
-    && Object.values(value.weights).every(weight => recordObject(weight) && flagValue(weight.value) && Number.isFinite(weight.percentage));
+    && Object.values(value.weights).every(weight => recordObject(weight) && isFlagValue(weight.value) && Number.isFinite(weight.percentage));
 }
 
 function blastRadius(value: unknown): value is BlastRadiusResult {
@@ -101,8 +100,9 @@ function isReceipt(value: unknown): value is Receipt {
     case 'pending_approval': {
       const plan = value.plan;
       return recordObject(plan) && typeof plan.declared_intent === 'string' && typeof plan.roster_version === 'string'
+        && typeof plan.affected_identities_digest === 'string' && typeof plan.baseline_revision === 'string'
         && Array.isArray(plan.reasons) && plan.reasons.length > 0
-        && plan.reasons.every(reason => reason === 'OVER_BUDGET' || reason === 'VIP_IMPACT' || reason === 'PROTECTED_FLAG')
+        && plan.reasons.every(reason => reason === 'OVER_BUDGET' || reason === 'VIP_IMPACT' || reason === 'PROTECTED_FLAG' || reason === 'UNKNOWN_IDENTITY')
         && blastRadius(plan.blast_radius) && writeContext(plan);
     }
     case 'write_attempted': return typeof value.roster_version === 'string' && writeContext(value.write);
@@ -132,9 +132,17 @@ export class ReceiptStore {
     return lines.map((line, index) => {
       try {
         const value: unknown = JSON.parse(line);
+        if (recordObject(value) && value.status === 'pending_approval' && recordObject(value.plan)
+          && !Object.hasOwn(value.plan, 'affected_identities_digest') && !Object.hasOwn(value.plan, 'baseline_revision')) {
+          // Old cards stay readable, but the missing impact proof makes any approval stale.
+          value.plan.affected_identities_digest = '';
+          value.plan.baseline_revision = 'unavailable';
+        }
         if (!isReceipt(value)) throw new Error();
         const previous = latest.get(value.request_id);
-        if (!permits(previous?.status, value.status)
+        // Keep old terminal records readable even though new writes cannot make this transition.
+        const legacyReconciliation = previous?.status === 'verified' && value.status === 'reconciled_not_applied';
+        if ((!legacyReconciliation && !permits(previous?.status, value.status))
           || (previous && (previous.environment !== value.environment || previous.mode !== value.mode))) throw new Error();
         latest.set(value.request_id, value);
         return value;

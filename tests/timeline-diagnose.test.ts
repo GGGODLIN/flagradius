@@ -3,6 +3,7 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createLiveEvaluationReader, runDiagnoseCli } from '../src/diagnose-cli.js';
+import { createFlagEvaluator } from '../src/evaluator.js';
 import { FlagsmithAdapter } from '../src/flagsmith-adapter.js';
 import { diagnoseTimeline } from '../src/timeline-diagnose.js';
 import { document, flag, roster, rule, state } from './fixtures.js';
@@ -15,6 +16,7 @@ const cleanups: Array<() => void> = [];
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   for (const cleanup of cleanups.splice(0)) cleanup();
 });
 
@@ -68,6 +70,55 @@ describe('timeline diagnosis', () => {
     expect(report.head_commit).toBe(commits[36]);
   }, 20_000);
 
+  test('hydrates a redacted multivariate snapshot only from a usable live key in the same scope', async () => {
+    const { capture, query, backend, git } = fixture();
+    const baseline = document(true);
+    baseline.feature_states[0].multivariate_feature_state_values = [
+      { id: 1, percentage_allocation: 50, multivariate_feature_option: { id: 11, value: 'A' } },
+      { id: 2, percentage_allocation: 50, multivariate_feature_option: { id: 12, value: 'B' } },
+    ];
+    capture(baseline, 'before-multivariate-change');
+    const changed = structuredClone(baseline);
+    changed.feature_states[0].multivariate_feature_state_values![0].multivariate_feature_option.value = 'C';
+    changed.feature_states[0].multivariate_feature_state_values![1].multivariate_feature_option.value = 'D';
+    const head = capture(changed, 'multivariate-change');
+    backend.live = changed;
+    const historical = createFlagEvaluator(baseline, flag)(roster[2]);
+    const live = createFlagEvaluator(changed, flag)(roster[2]);
+    expect(createFlagEvaluator({ ...changed, api_key: '[REDACTED]' }, flag)(roster[2])).not.toEqual(live);
+    const aligned = await diagnoseTimeline(query);
+    expect(aligned.parity).toEqual({ verdict: 'aligned', live, offline: live });
+    expect(aligned.transitions).toMatchObject([{ commit: head, before: historical, after: live }]);
+    expect(aligned.snapshot_gap).toBe(false);
+
+    for (const differentScope of [{ id: changed.id + 1 }, { project: { ...changed.project, id: changed.project.id + 1 } },
+      { api_key: '' }, { api_key: '[REDACTED]' }]) {
+      backend.live = { ...changed, ...differentScope };
+      const unaligned = await diagnoseTimeline(query);
+      expect(unaligned.parity).toMatchObject({ verdict: 'inputs_not_aligned', offline: null });
+      expect(unaligned.transitions).toEqual([]);
+      expect(unaligned.timeline_message).toContain('timeline replay incomplete');
+    }
+    const committed = git('show', `HEAD:environment-${environment}.json`);
+    expect(JSON.parse(committed).document.api_key).toBe('[REDACTED]');
+    expect(committed.includes(changed.api_key)).toBe(false);
+    expect(git('status', '--porcelain')).toBe('');
+  });
+
+  test('marks nested percentage splits incomplete when the snapshot key cannot be hydrated', async () => {
+    const { capture, query, backend } = fixture();
+    const baseline = document();
+    baseline.project.segments = [{ id: 9, name: 'percentage', feature_states: [state(true)], rules: [{
+      type: 'ALL', conditions: [], rules: [{ type: 'ALL', rules: [], conditions: [{ operator: 'PERCENTAGE_SPLIT', property_: null, value: '50' }] }],
+    }] }];
+    capture(baseline, 'percentage-split');
+    backend.live = { ...baseline, id: baseline.id + 1 };
+    expect(await diagnoseTimeline(query)).toMatchObject({
+      parity: { verdict: 'inputs_not_aligned', offline: null }, transitions: [],
+      timeline_message: expect.stringContaining('timeline replay incomplete'),
+    });
+  });
+
   test('reports an empty window explicitly and still compares live against HEAD', async () => {
     const { capture, query, backend } = fixture();
     const head = capture(document(true), 'old-baseline');
@@ -111,6 +162,25 @@ describe('timeline diagnosis', () => {
     const control = await setupWriteControl();
     expect(control.backend.writes).toEqual([{ type: 'set_environment_default', flag_name: flag, enabled: true }]);
     expect(control.git('rev-parse', 'HEAD')).not.toBe(control.initialHead);
+  });
+
+  test('the offline CLI rejects a fixture with malformed nested feature states', async () => {
+    const { capture, query } = fixture();
+    capture(document(), 'valid-snapshot');
+    const fixturePath = join(query.snapshotDirectory, '..', 'invalid.json');
+    const rosterPath = join(query.snapshotDirectory, '..', 'roster.json');
+    const doc = document();
+    writeFileSync(fixturePath, JSON.stringify({ ...doc, feature_states: [{ ...doc.feature_states[0], enabled: 'yes' }] }));
+    writeFileSync(rosterPath, JSON.stringify({ roster, roster_version: query.roster_version }));
+    vi.stubEnv('FLAGRADIUS_ENVIRONMENT', environment);
+    vi.stubEnv('FLAGRADIUS_FIXTURE_DOCUMENT', fixturePath);
+    vi.stubEnv('FLAGRADIUS_ROSTER_PATH', rosterPath);
+    vi.stubEnv('FLAGRADIUS_SNAPSHOT_DIRECTORY', query.snapshotDirectory);
+    const stdout = vi.fn();
+    const stderr = vi.fn();
+    expect(await runDiagnoseCli(cliArgs, undefined, { stdout, stderr })).toBe(1);
+    expect(stdout).not.toHaveBeenCalled();
+    expect(JSON.parse(stderr.mock.calls[0][0])).toMatchObject({ mode, code: 'INVALID_DOCUMENT' });
   });
 
   test('separates aligned evaluations, evaluation mismatches and missing inputs', async () => {
@@ -183,6 +253,22 @@ describe('timeline diagnosis', () => {
       expect(result).toMatchObject({ status: 'pending_approval', card: { blast_radius: candidate.blast_radius } });
     }
     expect(backend.writes).toEqual([]);
+  });
+
+  test('targeted recovery restores enabled and preserves a hotfix to the incident-changed value', async () => {
+    const { backend, query, capture } = fixture();
+    const atIncident = (enabled: boolean, value: string) => {
+      const doc = document(enabled);
+      doc.feature_states[0].feature_state_value = value;
+      return doc;
+    };
+    capture(atIncident(true, 'v1'), 'healthy');
+    capture(atIncident(false, 'v2'), 'incident');
+    backend.live = atIncident(false, 'hotfix');
+    const { candidates } = await diagnoseTimeline(query);
+    expect(candidates.find(candidate => candidate.kind === 'targeted')?.proposal.operation).toEqual({
+      type: 'set_identity_override', flag_name: flag, identifier: identity, enabled: true, value: 'hotfix',
+    });
   });
 
   test('preserves an unrelated live value edit and omits deletion of an override edited after the incident', async () => {

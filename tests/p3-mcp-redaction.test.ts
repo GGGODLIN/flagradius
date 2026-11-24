@@ -59,7 +59,9 @@ test('P3 hides generated roster identifiers and traits throughout MCP structured
         environment, declared_intent: first.identifier,
         operation: { type: 'set_identity_override', identifier: first.identifier, flag_name: flag, enabled: true },
       } });
-      const diagnosis = await client.callTool({ name: 'diagnose_flag_incident', arguments: { environment, flag_name: flag, identifier: first.identifier } });
+      const query = { environment, flag_name: flag, identifier: first.identifier };
+      const diagnosis = await client.callTool({ name: 'diagnose_flag_incident', arguments: query });
+      const legacyOptIn = await client.callTool({ name: 'diagnose_flag_incident', arguments: { ...query, echo_identifier: true } });
       expect(inspection.structuredContent).toMatchObject({ status: 'inspected', flags: [{ name: flag, enabled: false }], candidates: [segment] });
       expect(proposal.structuredContent).toMatchObject({
         status: 'pending_approval', mode, total_evaluated: roster.length, flipped_on: 1, flipped_off: 0,
@@ -69,7 +71,11 @@ test('P3 hides generated roster identifiers and traits throughout MCP structured
       expect(diagnosis.structuredContent).toMatchObject({ status: 'diagnosed', candidates: [segment], alignment: 'aligned',
         candidate_fixes: [{ type: 'set_identity_override', blast_radius: counts }],
       });
-      return Object.values(privacyResult([inspection, proposal, diagnosis], roster)).every(Boolean);
+      expect(legacyOptIn.structuredContent).toMatchObject({ status: 'error', code: 'INVALID_ARGUMENTS' });
+      for (const response of [inspection, proposal, diagnosis, legacyOptIn]) {
+        expect(privacyResult(response.structuredContent, roster)).toEqual({ identifiersHidden: true, traitsHidden: true });
+        expect(privacyResult(response.content, roster)).toEqual({ identifiersHidden: true, traitsHidden: true });
+      }
     } finally {
       try { await client.close(); await daemon.close(); } finally { fixture.cleanup(); }
     }

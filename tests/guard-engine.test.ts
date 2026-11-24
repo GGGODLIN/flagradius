@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createFlagEvaluator, evaluateTargetedBlastRadius } from '../src/evaluator.js';
 import { GuardEngine } from '../src/guard-engine.js';
 import type { GuardEngineOptions } from '../src/guard-engine.js';
 import type { ReceiptStore } from '../src/receipt-store.js';
@@ -132,6 +133,50 @@ describe('GuardEngine pre-write policy', () => {
     expect(backend.writes).toEqual([input.operation]);
   });
 
+  it('requires approval for an unknown identity with zero modeled flips or automatic writes', async () => {
+    const { backend, engine, receiptStore } = setup();
+    const identifier = 'synthetic-unmodeled-identity';
+    const result = await engine.proposeChange({ environment, declared_intent: identifier,
+      operation: { ...operation, type: 'set_identity_override', identifier },
+    });
+    expect(result).toMatchObject({ status: 'pending_approval', card: { reasons: ['UNKNOWN_IDENTITY'], blast_radius: { total_flipped: 0 } } });
+    expect(assertRequest(result, receiptStore)).toEqual(['received', 'evaluated', 'pending_approval']);
+    expect(backend.writes).toHaveLength(0);
+  });
+
+  it('rejects approval after segment drift changes who flips while counts stay identical', async () => {
+    const { backend, engine, options, receiptStore } = setup({ max_single_auto_flips: 0 });
+    backend.live.project.segments = [qa(9, 'internal_testers')];
+    const pending = await engine.proposeChange(scoped);
+    if (pending.status !== 'pending_approval') throw new Error('Expected a pending card');
+    expect(pending.blast_radius).toEqual({ total_evaluated: 2, total_flipped: 1, flipped_on: 1, flipped_off: 0, value_changed: 0, vip_hits: 0 });
+    const preview = () => backend.applyOperationToDocument(backend.live, { ...operation, type: 'set_segment_override', segment_id: 9 });
+    const enabled = () => options.roster.map(createFlagEvaluator(preview(), flag)).map(result => result.enabled);
+    expect(enabled()).toEqual([false, true]);
+    backend.live.project.segments[0].rules = [rule('cohort', 'standard')];
+    expect(enabled()).toEqual([true, false]);
+    expect(evaluateTargetedBlastRadius(backend.live, preview(), flag, options.roster)).toEqual(pending.blast_radius);
+    expect(await engine.approveCard(pending.card.id)).toMatchObject({ status: 'stale_approval', request_id: pending.request_id });
+    expect(assertRequest(pending, receiptStore)).toEqual(['received', 'evaluated', 'pending_approval', 'stale_approval']);
+    expect(backend.writes).toHaveLength(0);
+  });
+
+  it('reads legacy receipts but treats a pending card without impact proof as stale', async () => {
+    const { backend, engine, options, receiptStore } = setup({ max_single_auto_flips: 0 });
+    const pending = await engine.proposeChange(proposal);
+    if (pending.status !== 'pending_approval') throw new Error('Expected a pending card');
+    const legacy = receiptStore.readAll().map(receipt => {
+      if (receipt.status !== 'pending_approval') return receipt;
+      const { affected_identities_digest: _digest, baseline_revision: _revision, ...plan } = receipt.plan;
+      return { ...receipt, plan };
+    });
+    fs.writeFileSync(receiptStore.path, legacy.map(receipt => JSON.stringify(receipt)).join('\n') + '\n');
+    const restarted = new GuardEngine(options);
+    expect(await restarted.approveCard(pending.card.id)).toMatchObject({ status: 'stale_approval' });
+    expect(backend.writes).toHaveLength(0);
+    expect(await restarted.proposeChange(proposal)).toMatchObject({ status: 'pending_approval' });
+  });
+
   it('refuses approval after the environment alias has moved to another provider environment', async () => {
     const { backend, engine, options } = setup({ max_single_auto_flips: 0 });
     const pending = await engine.proposeChange(proposal);
@@ -202,6 +247,30 @@ describe('GuardEngine durability and input validation', () => {
     backend.onExecute = undefined;
     expect(await restarted.proposeChange(proposal)).toMatchObject({ status: 'snapshotted' });
     expect(backend.writes).toEqual([operation, operation]);
+  });
+
+  it('keeps a verified write crash-locked after an external revert to the original baseline', async () => {
+    const { engine, backend, receiptStore, snapshotStore, options } = setup();
+    const baseline = structuredClone(backend.live);
+    vi.spyOn(snapshotStore, 'commitSnapshot').mockImplementationOnce(() => { throw new Error('Simulated snapshot interruption'); });
+    await expect(engine.proposeChange(proposal)).rejects.toThrow('Simulated snapshot interruption');
+    const verified = receiptStore.readAll().at(-1)!;
+    expect(verified.status).toBe('verified');
+    expect(backend.live.feature_states[0].enabled).toBe(true);
+    backend.live = baseline;
+
+    const restarted = new GuardEngine(options);
+    const legacyTerminal = { ...verified, status: 'reconciled_not_applied' } as const;
+    expect(() => receiptStore.append(legacyTerminal, 'verified')).toThrow('Invalid receipt transition');
+    expect(await restarted.reconcileEnvironment(environment)).toMatchObject({
+      status: 'write_unconfirmed', code: 'VERIFIED_DRIFT_MISMATCH', request_id: verified.request_id,
+    });
+    expect(assertRequest(verified, receiptStore)).toEqual(['received', 'evaluated', 'auto_approved', 'write_attempted', 'verified']);
+    expect(await restarted.proposeChange(proposal)).toMatchObject({ status: 'blocked', code: 'ENV_CRASH_LOCKED' });
+    expect(backend.writes).toEqual([operation]);
+
+    fs.appendFileSync(receiptStore.path, `${JSON.stringify(legacyTerminal)}\n`);
+    expect(receiptStore.readAll().filter(receipt => receipt.request_id === verified.request_id).at(-1)?.status).toBe('reconciled_not_applied');
   });
 
   it('keeps an attempted receipt locked on restart, and does not snapshot a mismatching read-back', async () => {

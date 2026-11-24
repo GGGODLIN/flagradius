@@ -2,7 +2,7 @@ import { once } from 'node:events';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { expect, test } from 'vitest';
-import { FlagsmithAdapter } from '../src/flagsmith-adapter.js';
+import { FlagsmithAdapter, validateEnvironmentDocument } from '../src/flagsmith-adapter.js';
 import { FlagsmithError } from '../src/types.js';
 import { document, flag, rule, state } from './fixtures.js';
 
@@ -49,6 +49,21 @@ test.each([401, 403, 503])('live read fails closed with a redacted structured HT
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   }
 }, 8000);
+
+test('validates variants, nested segment rules and identity features in environment documents', () => {
+  const doc = document();
+  const cases = [
+    { ...doc, feature_states: [{ ...state(false), multivariate_feature_state_values: [null] }] },
+    { ...doc, project: { ...doc.project, segments: [{ id: 1, name: 'qa', feature_states: [], rules: [{ ...rule('cohort', 'qa'), rules: [null] }] }] } },
+    { ...doc, identity_overrides: [{ identifier: 'synthetic-identity', identity_features: [{ ...state(false), feature_state_value: {} }] }] },
+  ];
+  for (const invalid of cases) {
+    expect(() => validateEnvironmentDocument(invalid, 'OFFLINE_FIXTURE_REPLAY')).toThrow(expect.objectContaining({
+      mode: 'OFFLINE_FIXTURE_REPLAY', code: 'INVALID_DOCUMENT',
+    }));
+  }
+  expect(validateEnvironmentDocument(doc, 'OFFLINE_FIXTURE_REPLAY')).toBe(doc);
+});
 
 test('an unreachable server never falls back to a fixture', async () => {
   await expect(adapter().fetchEnvironmentDocument()).rejects.toMatchObject({ mode: 'LIVE_FLAGSMITH', code: 'LIVE_UNAVAILABLE' });

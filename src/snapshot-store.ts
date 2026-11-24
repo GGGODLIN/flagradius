@@ -24,7 +24,7 @@ function redactDocument(doc: EnvironmentDocument): EnvironmentDocument {
   };
 }
 
-function sortedJson(_key: string, value: unknown): unknown {
+export function sortedJson(_key: string, value: unknown): unknown {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
   const entries = Object.entries(value).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
   return Object.fromEntries(entries);

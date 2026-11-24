@@ -4,9 +4,10 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
+import { z } from 'zod';
 import type { FlagsmithBackend } from './guard-engine.js';
-import { FlagsmithError } from './types.js';
-import type { EnvironmentDocument, FeatureState, FlagWriteOperation, ModeTag } from './types.js';
+import { FlagsmithError, isFlagValue } from './types.js';
+import type { EnvironmentDocument, FeatureState, FlagWriteOperation, ModeTag, SegmentRule } from './types.js';
 
 const exec = promisify(execFile);
 
@@ -94,12 +95,49 @@ function httpFailure(status: number): FlagsmithError {
   return liveFailure('LIVE_HTTP_ERROR', `Flagsmith rejected the request (HTTP ${status}).`, status);
 }
 
-function parseDocument(value: unknown, expectedEnvironment: string, projectId: number): EnvironmentDocument {
-  const doc = value as Partial<EnvironmentDocument> | null;
-  if (!doc || doc.api_key !== expectedEnvironment || doc.project?.id !== projectId || !Array.isArray(doc.project.segments) || !Array.isArray(doc.feature_states) || (doc.identity_overrides !== undefined && !Array.isArray(doc.identity_overrides))) {
-    throw liveFailure('INVALID_DOCUMENT', 'The response is not an environment document for the configured scope.');
+const nonblank = z.string().refine(value => value.trim() !== '');
+const flagValue = z.custom(isFlagValue);
+const variantState = z.object({
+  id: z.int().nullish(), mv_fs_value_uuid: z.string().optional(), percentage_allocation: z.number().min(0).max(100),
+  multivariate_feature_option: z.object({ id: z.int(), value: flagValue, key: z.string().nullish() }),
+}).refine(variant => variant.id != null || !variant.mv_fs_value_uuid || /^[0-9a-f]+$/i.test(variant.mv_fs_value_uuid.replaceAll('-', '')));
+const featureState = z.object({
+  feature: z.object({ id: z.int(), name: nonblank, type: z.enum(['STANDARD', 'MULTIVARIATE']) }),
+  enabled: z.boolean(), feature_state_value: flagValue, django_id: z.int().nullish(), featurestate_uuid: z.string().optional(),
+  feature_segment: z.object({ priority: z.number() }).nullish(), multivariate_feature_state_values: z.array(variantState).optional(),
+});
+const segmentRule: z.ZodType<SegmentRule> = z.lazy(() => z.object({
+  type: z.enum(['ALL', 'ANY', 'NONE']), rules: z.array(segmentRule),
+  conditions: z.array(z.object({ operator: nonblank, property_: z.string().nullable(), value: z.string().nullable() })),
+}));
+const documentSchema = z.object({
+  id: z.int(), api_key: z.string(), name: z.string(), feature_states: z.array(featureState),
+  project: z.object({
+    id: z.int(), name: z.string(), hide_disabled_flags: z.boolean().optional(),
+    organisation: z.object({ id: z.int(), name: z.string(), feature_analytics: z.boolean().optional(),
+      stop_serving_flags: z.boolean().optional(), persist_trait_data: z.boolean().optional() }),
+    segments: z.array(z.object({ id: z.int().positive(), name: nonblank, rules: z.array(segmentRule), feature_states: z.array(featureState) })),
+  }),
+  identity_overrides: z.array(z.object({
+    identifier: nonblank, identity_features: z.array(featureState), environment_api_key: z.string().optional(),
+    django_id: z.int().nullish(), identity_uuid: z.string().optional(), created_date: z.string().optional(),
+    identity_traits: z.array(z.object({ trait_key: z.string(), trait_value: flagValue })).optional(),
+  })).optional(),
+});
+
+export function validateEnvironmentDocument(
+  value: unknown, mode: ModeTag, scope?: { environmentKey: string; projectId: number },
+): EnvironmentDocument {
+  try {
+    const parsed = documentSchema.safeParse(value);
+    if (parsed.success && (!scope || (parsed.data.api_key === scope.environmentKey && parsed.data.project.id === scope.projectId))) {
+      // The evaluator also consumes provider metadata that is outside the structural checks.
+      return value as EnvironmentDocument;
+    }
+  } catch {
+    // An excessively nested rule can exceed the validator's recursion limit.
   }
-  return doc as EnvironmentDocument;
+  throw new FlagsmithError(mode, 'INVALID_DOCUMENT', 'The response is not a valid environment document for the configured scope.');
 }
 
 export interface FlagsmithAdapterOptions {
@@ -205,7 +243,7 @@ export class FlagsmithAdapter implements FlagsmithBackend {
   async execute(op: FlagWriteOperation, checkedDocument?: EnvironmentDocument): Promise<void> {
     const before = checkedDocument === undefined
       ? await this.fetchEnvironmentDocument()
-      : parseDocument(checkedDocument, this.#options.environmentKey, this.#options.projectId);
+      : validateEnvironmentDocument(checkedDocument, this.mode, this.#options);
     this.applyOperationToDocument(before, op);
     await this.#runCli(writeArguments(op));
   }
@@ -250,7 +288,7 @@ export class FlagsmithAdapter implements FlagsmithBackend {
         redirect: 'error',
       });
       if (!response.ok) throw httpFailure(response.status);
-      return parseDocument(await response.json(), environmentKey, projectId);
+      return validateEnvironmentDocument(await response.json(), this.mode, { environmentKey, projectId });
     } catch (error) {
       if (error instanceof FlagsmithError) throw error;
       if (error instanceof SyntaxError) throw liveFailure('INVALID_DOCUMENT', 'Flagsmith returned malformed document JSON.');
@@ -261,7 +299,7 @@ export class FlagsmithAdapter implements FlagsmithBackend {
   async fetchCliEnvironmentDocument(): Promise<EnvironmentDocument> {
     const output = await this.#runCli(['environment', 'document']);
     try {
-      return parseDocument(JSON.parse(output), this.#options.environmentKey, this.#options.projectId);
+      return validateEnvironmentDocument(JSON.parse(output), this.mode, this.#options);
     } catch {
       throw liveFailure('INVALID_DOCUMENT', 'The CLI returned an invalid environment document for the configured scope.');
     }
