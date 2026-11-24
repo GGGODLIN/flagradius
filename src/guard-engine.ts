@@ -9,8 +9,6 @@ import type { SnapshotStore } from './snapshot-store.js';
 import { FlagsmithError } from './types.js';
 import type { BlastRadiusResult, EnvironmentDocument, FeatureState, FlagWriteOperation, ModeTag, RosterEntry } from './types.js';
 
-export { ALLOWED_RECEIPT_TRANSITIONS } from './receipt-store.js';
-
 export interface FlagsmithBackend {
   readonly mode: ModeTag;
   fetchEnvironmentDocument(): Promise<EnvironmentDocument>;
@@ -99,7 +97,7 @@ function intentFinding(doc: EnvironmentDocument, intent: string, operation: Flag
   if (candidates.length > 1) return { status: 'needs_disambiguation', code: 'NEEDS_DISAMBIGUATION', candidates } as const;
   return {
     status: 'blocked', code: 'BLOCKED_INTENT_MISMATCH', candidates,
-    ...(candidates.length === 1 && operation.type === 'set_environment_default'
+    ...(candidates.length === 1 && (operation.type === 'set_environment_default' || operation.type === 'set_segment_override')
       ? { suggested_action: { ...candidates[0], type: 'set_segment_override' as const } } : {}),
   } as const;
 }
@@ -131,7 +129,7 @@ function metadata({ mode, request_id, environment }: RequestMetadata): RequestMe
   return { mode, request_id, environment };
 }
 
-function cardFor(request: RequestMetadata, plan: ApprovalPlan): ApprovalCard {
+export function cardFor(request: RequestMetadata, plan: ApprovalPlan): ApprovalCard {
   const { operation } = plan;
   return structuredClone({
     ...metadata(request), id: request.request_id, status: 'pending',

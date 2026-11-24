@@ -85,6 +85,22 @@ describe('GuardEngine pre-write policy', () => {
     }
   });
 
+  it('suggests the unique QA segment and blocks a write to the wrong segment', async () => {
+    const { engine, backend } = setup();
+    backend.live.project.segments = [qa(9, 'internal_testers'), {
+      id: 10, name: 'general_access', rules: [rule('cohort', 'standard')], feature_states: [],
+    }];
+
+    const result = await engine.proposeChange({ ...scoped, operation: { ...scoped.operation, segment_id: 10 } });
+
+    expect(result).toMatchObject({
+      status: 'blocked', code: 'BLOCKED_INTENT_MISMATCH',
+      candidates: [{ segment_id: 9, name: 'internal_testers' }],
+      suggested_action: { type: 'set_segment_override', segment_id: 9, name: 'internal_testers' },
+    });
+    expect(backend.writes).toEqual([]);
+  });
+
   it('rejects fields that attempt to give an environment default a narrower scope', async () => {
     const { engine, backend } = setup();
     backend.live.project.segments = [qa(9, 'internal_testers')];

@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, expect, test } from 'vitest';
 import { buildExecutorRuntime, startExecutorDaemon } from '../src/executor-daemon.js';
 import { generateRoster } from '../src/roster.js';
-import { document, flag, roster, state } from './fixtures.js';
+import { document, flag, roster, rule, state } from './fixtures.js';
 import { environment, setup } from './guard-fixture.js';
 
 const mode = 'LIVE_FLAGSMITH';
@@ -134,6 +134,58 @@ test('standalone diagnosis reads its configured roster, Git snapshot and transie
   expect(provider.identities).toEqual([{ identifier: customIdentity.identifier, transient: true,
     traits: [{ trait_key: 'cohort', trait_value: 'internal_testers', transient: true }],
   }]);
+});
+
+test('standalone diagnosis adds recovery impact and the actual scope to each Approval Card', async () => {
+  const healthy = document(true);
+  const segment = { id: 7, name: 'internal_testers', rules: [rule('cohort', 'internal_testers')], feature_states: [] };
+  healthy.project.segments.push(segment);
+  const incident = { ...healthy, project: { ...healthy.project, segments: [{ ...segment,
+    feature_states: [state(false, { django_id: 207, feature_segment: { priority: 0 } })],
+  }] } };
+  const provider = await startProvider(incident);
+  env.FLAGRADIUS_PROTECTED_FLAGS = flag;
+  writeFileSync(rosterPath, JSON.stringify({ roster: [customIdentity, roster[2]], roster_version: version }));
+  for (const [document, request_id] of [[healthy, 'baseline'], [incident, 'incident']] as const) {
+    fixture.snapshotStore.commitSnapshot({ document, environment, mode, request_id, roster_version: version });
+  }
+  const { post } = await startRuntime();
+  const operations = [
+    { declared_intent: customIdentity.identifier, operation: { type: 'set_identity_override', flag_name: flag,
+      identifier: customIdentity.identifier, enabled: true, value: 'control' }, scope: `Identity · ${customIdentity.identifier}` },
+    { declared_intent: segment.name, operation: { type: 'delete_segment_override', flag_name: flag, segment_id: segment.id },
+      scope: `Segment #${segment.id} · ${segment.name}` },
+  ];
+  const cards = [];
+  for (const { declared_intent, operation } of operations) {
+    const response = await post('propose', { environment, declared_intent, operation });
+    expect(response.status).toBe(200);
+    const card = await response.json();
+    expect(card.status).toBe('pending_approval');
+    cards.push(card.approval_url);
+  }
+  const loadCard = async (url: string) => {
+    const response = await fetch(url, { headers: { authorization: `Bearer ${humanApprovalToken}` } });
+    expect(response.status).toBe(200);
+    return response.text();
+  };
+  expect(await loadCard(cards[0])).not.toContain('<h2>Comparison</h2>');
+  const response = await post('diagnose', { environment, flag_name: flag, identifier: customIdentity.identifier });
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({ status: 'diagnosed', alignment: 'aligned', candidate_fixes: [
+    { type: 'set_identity_override', blast_radius: { total_flipped: 1 } },
+    { type: 'delete_segment_override', blast_radius: { total_flipped: 2 } },
+  ] });
+
+  for (const [index, { operation, scope }] of operations.entries()) {
+    const html = await loadCard(cards[index]);
+    expect(html).toContain('<h2>Comparison</h2>');
+    expect(html).toContain('<dt>Apply an identity override</dt><dd>1 affected</dd>');
+    expect(html).toContain('<dt>Revert the segment override</dt><dd>2 affected</dd>');
+    expect(html).toContain(`<p>Approve applies ${operation.type} (${scope}) on this card.</p>`);
+  }
+  expect(provider.calls.filter(method => method !== 'GET')).toEqual(['POST']);
+  expect(provider.identities).toEqual([expect.objectContaining({ transient: true })]);
 });
 
 test('standalone inspect returns 502 INVALID_DOCUMENT for malformed nested feature state', async () => {

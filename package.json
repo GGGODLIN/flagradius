@@ -11,6 +11,7 @@
     "executor-daemon": "node --import tsx src/executor-daemon.ts",
     "demo": "bash scripts/run-live-e2e.sh --demo",
     "diagnose": "node --import tsx src/diagnose-cli.ts",
+    "snapshot": "node --import tsx src/snapshot-cli.ts",
     "test:live-e2e": "bash scripts/run-live-e2e.sh"
   },
   "dependencies": {

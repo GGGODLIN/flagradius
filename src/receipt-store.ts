@@ -4,7 +4,7 @@ import { validateOperation } from './flagsmith-adapter.js';
 import { isFlagValue } from './types.js';
 import type { BlastRadiusResult, FlagValue, FlagWriteOperation, ModeTag } from './types.js';
 
-export const ALLOWED_RECEIPT_TRANSITIONS = {
+const ALLOWED_RECEIPT_TRANSITIONS = {
   received: ['evaluated', 'blocked', 'needs_disambiguation'],
   evaluated: ['auto_approved', 'pending_approval'],
   auto_approved: ['write_attempted', 'stale_approval', 'blocked'],

@@ -376,6 +376,15 @@ export async function diagnoseTimeline(options: DiagnoseTimelineOptions): Promis
   };
 }
 
+export function summarizeDiagnosis(report: DiagnosisReport) {
+  return {
+    alignment: report.parity.verdict, snapshot_gap: report.snapshot_gap,
+    candidate_fixes: report.candidates.map(({ proposal: { operation }, blast_radius }) => ({
+      type: operation.type, ...('segment_id' in operation && { segment_id: operation.segment_id }), blast_radius,
+    })),
+  };
+}
+
 export function formatDiagnosisReport(report: DiagnosisReport): string {
   return JSON.stringify(report, null, 2);
 }

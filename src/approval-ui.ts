@@ -57,7 +57,7 @@ function renderContent(path: string, state: ApprovalPage['state']): string {
       <div><dt>Apply an identity override</dt><dd>${escapeHtml(comparison.targeted)} affected</dd></div>
       <div><dt>Revert the segment override</dt><dd>${escapeHtml(comparison.revert)} affected</dd></div>
     </dl>
-    <p>Approve applies the identity override on this card.</p>` : ''}
+    <p>Approve applies ${escapeHtml(card.target)} (${escapeHtml(scope)}) on this card.</p>` : ''}
     <div class="actions">
       <form method="post" action="${escapeHtml(path)}/approve">
         <input type="hidden" name="token" value="${escapeHtml(token)}">

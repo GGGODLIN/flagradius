@@ -20,7 +20,7 @@ import { ReceiptStore } from './receipt-store.js';
 import type { Receipt } from './receipt-store.js';
 import { generateRoster } from './roster.js';
 import { SnapshotStore } from './snapshot-store.js';
-import { diagnoseTimeline } from './timeline-diagnose.js';
+import { diagnoseTimeline, summarizeDiagnosis } from './timeline-diagnose.js';
 import type { DiagnoseTimelineOptions, DiagnosisReport } from './timeline-diagnose.js';
 import type { EnvironmentDocument, ModeTag } from './types.js';
 
@@ -111,9 +111,7 @@ export async function runUnifiedDemo(options: DemoOptions) {
       diagnosis = await diagnoseTimeline({ environment: query.environment, flag: query.flag_name, identity: query.identifier,
         since: query.since, backend, snapshotDirectory: snapshotStore.directory, roster, roster_version,
         readLiveEvaluation: options.readLiveEvaluation });
-      return { alignment: diagnosis.parity.verdict, snapshot_gap: diagnosis.snapshot_gap,
-        candidate_fixes: diagnosis.candidates.map(({ proposal, blast_radius }) => ({ type: proposal.operation.type,
-          ...('segment_id' in proposal.operation ? { segment_id: proposal.operation.segment_id } : {}), blast_radius })) };
+      return summarizeDiagnosis(diagnosis);
     },
   });
   const transport = new StdioClientTransport({
@@ -251,13 +249,11 @@ export async function runUnifiedDemo(options: DemoOptions) {
     } else {
       await askForApproval(url, humanApprovalToken);
       const deadline = Date.now() + 10 * 60_000;
-      while (history(pending.request_id).at(-1)?.status === 'pending_approval') {
-        assert(Date.now() < deadline, 'Timed out waiting for operator approval');
-        await setTimeout(250, undefined, { signal });
-      }
-      // Approval writes a sequence of durable receipts before returning the final card.
-      while (['write_attempted', 'verified'].includes(history(pending.request_id).at(-1)?.status ?? '')) {
-        assert(Date.now() < deadline, 'Timed out waiting for verified recovery');
+      while (true) {
+        const status = history(pending.request_id).at(-1)?.status;
+        if (status !== 'pending_approval' && status !== 'write_attempted' && status !== 'verified') break;
+        assert(Date.now() < deadline, status === 'pending_approval'
+          ? 'Timed out waiting for operator approval' : 'Timed out waiting for verified recovery');
         await setTimeout(250, undefined, { signal });
       }
     }

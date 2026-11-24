@@ -8,13 +8,13 @@ import { renderApprovalPage } from './approval-ui.js';
 import type { ApprovalComparison } from './approval-ui.js';
 import { createLiveEvaluationReader } from './diagnose-cli.js';
 import { FlagsmithAdapter } from './flagsmith-adapter.js';
-import { GuardEngine } from './guard-engine.js';
+import { cardFor, GuardEngine } from './guard-engine.js';
 import type { ApprovalCard, FlagsmithBackend } from './guard-engine.js';
 import { redactMcpPayload } from './mcp-guard.js';
 import { ReceiptStore } from './receipt-store.js';
 import { generateRoster, loadRosterFile } from './roster.js';
 import { SnapshotStore } from './snapshot-store.js';
-import { diagnoseTimeline } from './timeline-diagnose.js';
+import { diagnoseTimeline, summarizeDiagnosis } from './timeline-diagnose.js';
 import { FlagsmithError } from './types.js';
 import type { ModeTag } from './types.js';
 
@@ -81,16 +81,7 @@ function readCard(receiptStore: ReceiptStore, id: string) {
   const history = receiptStore.readAll().filter(receipt => receipt.request_id === id);
   const pending = history.find(receipt => receipt.status === 'pending_approval');
   if (!pending) return;
-  const { environment, mode, plan } = pending;
-  const { operation } = plan;
-  const card: ApprovalCard = {
-    id, request_id: id, mode, environment, status: 'pending', flag_name: operation.flag_name,
-    target: operation.type, baseline_revision: plan.baseline_revision, blast_radius: plan.blast_radius,
-    target_baseline_state: plan.target_baseline_state, reasons: plan.reasons,
-    ...('segment_id' in operation && { segment_id: operation.segment_id }),
-    ...('identifier' in operation && { identifier: operation.identifier }),
-  };
-  return { card, latest: history.at(-1)! };
+  return { card: cardFor(pending, pending.plan), latest: history.at(-1)! };
 }
 
 export async function startExecutorDaemon(options: ExecutorDaemonOptions) {
@@ -276,6 +267,7 @@ export async function buildExecutorRuntime(env: NodeJS.ProcessEnv): Promise<Exec
   const environments = { [environment]: new FlagsmithAdapter(adapterOptions) };
   const engine = new GuardEngine({ environments, roster, roster_version, max_single_auto_flips, protected_flags, receiptStore, snapshotStore });
   const readLiveEvaluation = createLiveEvaluationReader(adapterOptions);
+  const comparisons = new Map<string, ApprovalComparison>();
   return {
     engine, receiptStore, environments, port,
     async onDiagnose(query) {
@@ -283,13 +275,17 @@ export async function buildExecutorRuntime(env: NodeJS.ProcessEnv): Promise<Exec
         environment: query.environment, flag: query.flag_name, identity: query.identifier, since: query.since,
         snapshotDirectory: snapshotStore.directory, roster, roster_version, backend: environments[query.environment], readLiveEvaluation,
       });
-      return {
-        alignment: diagnosis.parity.verdict, snapshot_gap: diagnosis.snapshot_gap,
-        candidate_fixes: diagnosis.candidates.map(({ proposal: { operation }, blast_radius }) => ({
-          type: operation.type, ...('segment_id' in operation && { segment_id: operation.segment_id }), blast_radius,
-        })),
-      };
+      const key = `${query.environment}\0${query.flag_name}`;
+      const targeted = diagnosis.candidates.find(candidate => candidate.kind === 'targeted');
+      const revert = diagnosis.candidates.find(candidate => candidate.kind === 'revert');
+      if (targeted && revert) {
+        comparisons.set(key, { targeted: targeted.blast_radius.total_flipped, revert: revert.blast_radius.total_flipped });
+      } else {
+        comparisons.delete(key);
+      }
+      return summarizeDiagnosis(diagnosis);
     },
+    approvalComparison: card => comparisons.get(`${card.environment}\0${card.flag_name}`),
     proposalToken: env.FLAGRADIUS_PROPOSAL_TOKEN ?? '',
     humanApprovalToken: env.FLAGRADIUS_HUMAN_APPROVAL_TOKEN ?? '',
   };

@@ -53,6 +53,8 @@ npm run diagnose -- --env sandbox --flag new_search --identity vip-acme-042 --si
 
 Provide the Flagsmith API and environment settings from [.env.example](/.env.example), the snapshot directory via `FLAGRADIUS_SNAPSHOT_DIRECTORY`, and your roster via `FLAGRADIUS_ROSTER_PATH`. The roster JSON object has `roster_version` and a `roster` array of `{ "identifier", "traits", "vip" }` entries. Its version must match the recorded snapshots. For fixture replay, set `FLAGRADIUS_FIXTURE_DOCUMENT` to an environment document file. Results then carry `OFFLINE_FIXTURE_REPLAY`.
 
+Run `npm run snapshot -- --env sandbox --init` to record a redacted Git baseline, or omit `--init` for a later manual capture. Both only read from Flagsmith.
+
 Diagnosis walks the Git history in order so a flag that flipped more than once still yields each recorded transition. An out-of-band change can appear as a live-to-HEAD `snapshot_gap`. Diagnosis reports candidate operations and their impact. Any recovery write starts with a separate proposal.
 
 ## Boundaries
