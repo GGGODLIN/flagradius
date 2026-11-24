@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { renderApprovalPage } from './approval-ui.js';
+import type { ApprovalComparison } from './approval-ui.js';
 import { FlagsmithAdapter } from './flagsmith-adapter.js';
 import { GuardEngine } from './guard-engine.js';
 import type { ApprovalCard, FlagsmithBackend } from './guard-engine.js';
@@ -30,6 +31,7 @@ export interface ExecutorDaemonOptions {
   port?: number;
   handleSignals?: boolean;
   onDiagnose?: (query: DiagnoseQuery) => unknown | Promise<unknown>;
+  approvalComparison?: (card: ApprovalCard) => ApprovalComparison | undefined;
 }
 
 const loopback = '127.0.0.1';
@@ -177,7 +179,7 @@ export async function startExecutorDaemon(options: ExecutorDaemonOptions) {
     }
     const segmentName = card.segment_id === undefined ? undefined : await environments.get(card.environment)?.fetchEnvironmentDocument()
       .then(doc => doc.project.segments.find(segment => segment.id === card.segment_id)?.name).catch(() => undefined);
-    return render({ status: 'pending', card, segmentName, token: humanApprovalToken });
+    return render({ status: 'pending', card, segmentName, token: humanApprovalToken, comparison: options.approvalComparison?.(card) });
   }
 
   async function route(request: IncomingMessage, response: ServerResponse) {

@@ -4,11 +4,16 @@ import type { ModeTag } from './types.js';
 const entities: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const escapeHtml = (value: string | number) => String(value).replace(/[&<>"']/g, character => entities[character]);
 
+export interface ApprovalComparison {
+  targeted: number;
+  revert: number;
+}
+
 interface ApprovalPage {
   path: string;
   mode: ModeTag;
   state: { status: 'locked' }
-    | { status: 'pending'; card: ApprovalCard; segmentName?: string; token: string }
+    | { status: 'pending'; card: ApprovalCard; segmentName?: string; token: string; comparison?: ApprovalComparison }
     | { status: 'terminal'; result: string; code?: string };
 }
 
@@ -31,7 +36,7 @@ function renderContent(path: string, state: ApprovalPage['state']): string {
     <p class="outcome" role="status">${escapeHtml(state.result)}</p>
     <p>${escapeHtml(outcomes[state.result] ?? state.code ?? 'The decision could not be processed.')}</p>`;
 
-  const { card, segmentName, token } = state;
+  const { card, segmentName, token, comparison } = state;
   const impact = card.blast_radius;
   const scope = card.segment_id !== undefined ? `Segment #${card.segment_id}${segmentName ? ` · ${segmentName}` : ''}`
     : card.identifier !== undefined ? `Identity · ${card.identifier}` : 'Environment default';
@@ -47,6 +52,12 @@ function renderContent(path: string, state: ApprovalPage['state']): string {
       <li class="off">-OFF ${impact.flipped_off}</li>
       <li>~value_changed ${impact.value_changed}</li>
     </ul>
+    ${comparison ? `<h2>Comparison</h2>
+    <dl>
+      <div><dt>Apply an identity override</dt><dd>${escapeHtml(comparison.targeted)} affected</dd></div>
+      <div><dt>Revert the segment override</dt><dd>${escapeHtml(comparison.revert)} affected</dd></div>
+    </dl>
+    <p>Approve applies the identity override on this card.</p>` : ''}
     <div class="actions">
       <form method="post" action="${escapeHtml(path)}/approve">
         <input type="hidden" name="token" value="${escapeHtml(token)}">
