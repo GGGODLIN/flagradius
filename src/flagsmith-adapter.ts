@@ -4,8 +4,9 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
+import type { FlagsmithBackend } from './guard-engine.js';
 import { FlagsmithError } from './types.js';
-import type { EnvironmentDocument, FeatureState, FlagWriteOperation } from './types.js';
+import type { EnvironmentDocument, FeatureState, FlagWriteOperation, ModeTag } from './types.js';
 
 const exec = promisify(execFile);
 
@@ -29,12 +30,16 @@ function invalidOperation(message: string): never {
   throw new FlagsmithError('OFFLINE_FIXTURE_REPLAY', 'INVALID_WRITE_OPERATION', message);
 }
 
-function validateOperation(op: FlagWriteOperation): void {
-  if (!op.flag_name || op.flag_name.startsWith('-')) invalidOperation('A valid flag name is required.');
-  if ('segment_id' in op && (!Number.isSafeInteger(op.segment_id) || op.segment_id <= 0)) {
-    invalidOperation('Segment ID must be a positive integer.');
-  }
-  if ('identifier' in op && !op.identifier) invalidOperation('An identity identifier is required.');
+export function validateOperation(input: unknown): asserts input is FlagWriteOperation {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) invalidOperation('A flag operation is required.');
+  const op = input as FlagWriteOperation;
+  if (typeof op.flag_name !== 'string' || !op.flag_name.trim() || op.flag_name.startsWith('-')) invalidOperation('A valid flag name is required.');
+  if (op.type === 'set_segment_override' || op.type === 'delete_segment_override') {
+    if (!Number.isSafeInteger(op.segment_id) || op.segment_id <= 0) invalidOperation('Segment ID must be a positive integer.');
+  } else if ('segment_id' in op) invalidOperation('Segment ID is only valid for a segment override.');
+  if (op.type === 'set_identity_override' || op.type === 'delete_identity_override') {
+    if (typeof op.identifier !== 'string' || !op.identifier.trim()) invalidOperation('An identity identifier is required.');
+  } else if ('identifier' in op) invalidOperation('Identity identifier is only valid for an identity override.');
   switch (op.type) {
     case 'set_environment_default':
     case 'set_segment_override':
@@ -46,6 +51,7 @@ function validateOperation(op: FlagWriteOperation): void {
       }
       break;
     case 'set_multivariate_weights': {
+      if (!op.weights || typeof op.weights !== 'object' || Array.isArray(op.weights)) invalidOperation('Variant weights are required.');
       const weights = Object.entries(op.weights);
       if (weights.length === 0 || weights.some(([id, weight]) => !/^[1-9]\d*$/.test(id) || !Number.isSafeInteger(Number(id)) || !Number.isFinite(weight) || weight < 0 || weight > 100)) {
         invalidOperation('Provide variant IDs with percentage weights from 0 to 100.');
@@ -105,7 +111,8 @@ export interface FlagsmithAdapterOptions {
   timeoutMs?: number;
 }
 
-export class FlagsmithAdapter {
+export class FlagsmithAdapter implements FlagsmithBackend {
+  readonly mode: ModeTag = 'LIVE_FLAGSMITH';
   readonly #options: FlagsmithAdapterOptions;
 
   constructor(options: FlagsmithAdapterOptions) {
@@ -195,8 +202,10 @@ export class FlagsmithAdapter {
     }
   }
 
-  async execute(op: FlagWriteOperation): Promise<void> {
-    const before = await this.fetchEnvironmentDocument();
+  async execute(op: FlagWriteOperation, checkedDocument?: EnvironmentDocument): Promise<void> {
+    const before = checkedDocument === undefined
+      ? await this.fetchEnvironmentDocument()
+      : parseDocument(checkedDocument, this.#options.environmentKey, this.#options.projectId);
     this.applyOperationToDocument(before, op);
     await this.#runCli(writeArguments(op));
   }
