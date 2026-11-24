@@ -3,10 +3,10 @@ set -euo pipefail
 umask 077
 cd "$(dirname "$0")/.."
 
+if [[ "${1:-}" == --seeded || ( "${1:-}" == --demo && "${2:-}" == --seeded ) ]]; then
+  exec node --import tsx src/demo.ts
+fi
 case "${1:-}" in
-  --seeded)
-    exec node --import tsx src/demo.ts
-    ;;
   --demo|'') ;;
   *) printf '%s\n' 'Usage: bash scripts/run-live-e2e.sh [--demo]' >&2; exit 2 ;;
 esac
