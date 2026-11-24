@@ -6,6 +6,7 @@ import { isDeepStrictEqual, promisify } from 'node:util';
 import { createFlagEvaluator, evaluateTargetedBlastRadius } from './evaluator.js';
 import type { FlagsmithBackend, GuardProposal } from './guard-engine.js';
 import { recordObject } from './receipt-store.js';
+import { normalizeDocumentForComparison } from './snapshot-store.js';
 import type { EnvironmentSnapshot } from './snapshot-store.js';
 import { FlagsmithError, isFlagValue } from './types.js';
 import type { BlastRadiusResult, EnvironmentDocument, FeatureState, FlagValue, FlagWriteOperation, ModeTag, RosterEntry, SegmentRule } from './types.js';
@@ -144,15 +145,7 @@ async function snapshotHistory(options: DiagnoseTimelineOptions) {
 }
 
 function withoutCredentials(doc: EnvironmentDocument) {
-  const { api_key: _key, identity_overrides, ...document } = doc;
-  return {
-    ...document,
-    identity_overrides: Array.isArray(identity_overrides) ? identity_overrides.map(entry => {
-      if (!recordObject(entry)) return entry;
-      const { environment_api_key: _identityKey, ...identity } = entry;
-      return identity;
-    }) : identity_overrides ?? [],
-  };
+  return normalizeDocumentForComparison(doc);
 }
 
 function validRule(rule: SegmentRule, traits: ReadonlySet<string>): boolean {

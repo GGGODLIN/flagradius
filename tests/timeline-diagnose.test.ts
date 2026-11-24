@@ -300,6 +300,21 @@ describe('timeline diagnosis', () => {
     });
   });
 
+  test('ignores volatile provider identity_uuid regeneration when checking snapshot_gap', async () => {
+    const { backend, query, capture } = fixture();
+    const withOverride = backend.applyOperationToDocument(backend.live, {
+      type: 'set_identity_override', flag_name: flag, identifier: identity, enabled: true, value: 'v1',
+    });
+    withOverride.identity_overrides = withOverride.identity_overrides?.map(entry => ({ ...entry, identity_uuid: 'uuid-first-read' }));
+    capture(withOverride, 'override-saved');
+    const secondRead = structuredClone(withOverride);
+    secondRead.identity_overrides = secondRead.identity_overrides?.map(entry => ({ ...entry, identity_uuid: 'uuid-second-read' }));
+    backend.live = secondRead;
+    const report = await diagnoseTimeline(query);
+    expect(report.snapshot_gap).toBe(false);
+    expect(report.snapshot_gap_reason).toBeNull();
+  });
+
   test('fails with a structured error for missing repositories and malformed committed snapshots', async () => {
     const { backend, query, capture, git, cli, snapshotStore } = fixture();
     await expect(diagnoseTimeline(query)).rejects.toMatchObject({ mode, code: 'SNAPSHOT_REPOSITORY_UNAVAILABLE' });

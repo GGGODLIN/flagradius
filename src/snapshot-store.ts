@@ -15,12 +15,30 @@ function redactDocument(doc: EnvironmentDocument): EnvironmentDocument {
     api_key: '[REDACTED]',
     ...(doc.identity_overrides
       ? {
-          identity_overrides: doc.identity_overrides.map(entry => ({
-            ...entry,
-            ...(entry.environment_api_key !== undefined ? { environment_api_key: '[REDACTED]' } : {}),
-          })),
+          identity_overrides: doc.identity_overrides.map(entry => {
+            // Flagsmith v2.263.0 synthesizes a fresh random identity_uuid per read when serializing Postgres identities.
+            const { identity_uuid: _volatileUuid, ...rest } = entry;
+            return {
+              ...rest,
+              ...(entry.environment_api_key !== undefined ? { environment_api_key: '[REDACTED]' } : {}),
+            };
+          }),
         }
       : {}),
+  };
+}
+
+export function normalizeDocumentForComparison(doc: EnvironmentDocument) {
+  const { api_key: _key, identity_overrides, ...document } = doc;
+  return {
+    ...document,
+    identity_overrides: Array.isArray(identity_overrides)
+      ? identity_overrides.map(entry => {
+          if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry;
+          const { environment_api_key: _identityKey, identity_uuid: _volatileUuid, ...identity } = entry;
+          return identity;
+        })
+      : identity_overrides ?? [],
   };
 }
 

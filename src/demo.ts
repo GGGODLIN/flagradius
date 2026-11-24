@@ -19,7 +19,7 @@ import type { FlagsmithBackend, GuardProposal } from './guard-engine.js';
 import { ReceiptStore } from './receipt-store.js';
 import type { Receipt } from './receipt-store.js';
 import { generateRoster } from './roster.js';
-import { SnapshotStore } from './snapshot-store.js';
+import { normalizeDocumentForComparison, SnapshotStore } from './snapshot-store.js';
 import { diagnoseTimeline, summarizeDiagnosis } from './timeline-diagnose.js';
 import type { DiagnoseTimelineOptions, DiagnosisReport } from './timeline-diagnose.js';
 import type { EnvironmentDocument, ModeTag } from './types.js';
@@ -177,7 +177,7 @@ export async function runUnifiedDemo(options: DemoOptions) {
     assert.equal(blocked.code, 'BLOCKED_INTENT_MISMATCH');
     assert.deepEqual(blocked.suggested_action, { type: 'set_segment_override', segment_id: qaSegmentId, name: 'internal_testers' });
     assert.deepEqual(history(blocked.request_id).map(row => row.status), ['received', 'blocked']);
-    assert(isDeepStrictEqual(await options.readBack(), initial), 'Blocked request changed the environment');
+    assert(isDeepStrictEqual(normalizeDocumentForComparison(await options.readBack()), normalizeDocumentForComparison(initial)), 'Blocked request changed the environment');
     publish('act1_blocked', { intent: 'enable new_search for QA', broadScope, blocked });
 
     const narrowed = await propose('QA', { type: 'set_segment_override', flag_name: flag,
@@ -282,7 +282,7 @@ export async function runUnifiedDemo(options: DemoOptions) {
     const writes = receipts.filter(receipt => receipt.status === 'write_attempted').length;
     assert.equal(writes, 0);
     assert.equal(receipts.at(-1)?.status, 'stale_approval');
-    assert(isDeepStrictEqual(await options.readBack(), edited), 'Stale approval modified Flagsmith');
+    assert(isDeepStrictEqual(normalizeDocumentForComparison(await options.readBack()), normalizeDocumentForComparison(edited)), 'Stale approval modified Flagsmith');
     const evidence = { mode, status: 'stale_approval', requestId: pending.request_id, writes, unchanged: true };
     publish('stale_approval', evidence);
     return evidence;
