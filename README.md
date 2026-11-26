@@ -4,6 +4,8 @@ An agent asks to enable `new_search` for QA. It proposes turning the production 
 
 Built for Toggle Wars Track 02, AI Agents and Feature Flags.
 
+- **Demo Video (56s, 1080p30)**: https://youtu.be/ticc7dkmoqk
+
 ## Run the sandbox
 
 Install Node.js 24 or newer, Git, OpenSSL, Make, and Docker with Compose v2. Start Docker, then run this command in a terminal on the same machine as your browser.
