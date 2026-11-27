@@ -4,7 +4,7 @@ An agent asks to enable `new_search` for QA. It proposes turning the production 
 
 Built for Toggle Wars — entering **Track 02** (AI Agents and Feature Flags), **Track 03** (Build on Open Source Flagsmith), and **Track 04** (Flagsmith Agent Skills).
 
-- **Demo Video (1080p30)**: https://youtu.be/ticc7dkmoqk
+- **Demo Video (64s, 1080p30 — includes Track 04 Skill & Token Receipt)**: https://youtu.be/ucbc1Iaa-D4
 - **Agent Skill (Track 04)**: [skills/flagradius-safe-rollout/SKILL.md](/skills/flagradius-safe-rollout/SKILL.md) (follows [agentskills.io/specification](https://agentskills.io/specification); verified CLI `--no-input --jq` token benchmark in [eval/demo-run-receipt.json](/skills/flagradius-safe-rollout/eval/demo-run-receipt.json))
 
 ## Run the sandbox
