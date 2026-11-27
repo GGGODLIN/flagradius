@@ -1,0 +1,53 @@
+{
+  "skill_name": "flagradius-safe-rollout",
+  "spec": "https://agentskills.io/specification",
+  "flagsmith_cli_version": "2.0.0",
+  "tested_agent": "Claude Code (subagent routed-impl)",
+  "tested_model": "gpt-6.2-sol (via Claude Code subagent transcript agent-ae60e2cc0a7e2006d)",
+  "measured_at": "2026-11-27",
+  "skill_footprint": {
+    "skill_md_lines": 50,
+    "skill_md_chars": 4442,
+    "skill_md_est_tokens": 1110,
+    "progressive_disclosure_references_loaded": false
+  },
+  "cli_jq_efficiency": {
+    "commands_measured": [
+      {
+        "cmd": "flagsmith config --no-input --jq '{apiUrl:.apiUrl.value,project:.project.value,environment:.environment.value}'",
+        "output_bytes": 81
+      },
+      {
+        "cmd": "flagsmith flag get new_search --no-input --jq '{feature,enabled,value,segment_overrides,identity_overrides}'",
+        "output_bytes": 98
+      },
+      {
+        "cmd": "flagsmith segment list --no-input --jq '[.[] | {id,name}]'",
+        "output_bytes": 65
+      },
+      {
+        "cmd": "flagsmith evaluate new_search --identity qa-01 --no-input --jq '{enabled,value}'",
+        "output_bytes": 29
+      },
+      {
+        "cmd": "flagsmith evaluate new_search --identity vip-acme-042 --no-input --jq '{enabled,value}'",
+        "output_bytes": 35
+      }
+    ],
+    "total_cli_jq_output_bytes": 308,
+    "total_cli_jq_est_tokens": 77,
+    "raw_unfiltered_json_est_bytes": 11200,
+    "cli_output_token_savings_pct": 97.2
+  },
+  "agent_demo_run": {
+    "tool_uses": 3,
+    "workflows_verified": [
+      "Workflow A: compact --no-input --jq discovery -> broad default BLOCKED_INTENT_MISMATCH -> narrowed segment #3 internal_testers snapshotted",
+      "Workflow B: zero-write /api/diagnose (alignment=aligned) -> flagsmith evaluate --no-input --jq -> minimal-blast rollback handle"
+    ],
+    "model_output_tokens": 8691,
+    "workflow_payload_est_tokens": 1460,
+    "host_harness_reported_subagent_tokens": 63881,
+    "note": "host_harness_reported_subagent_tokens includes host IDE system instructions and unrelated MCP tool schemas; skill + CLI --jq + FlagRadius guard responses themselves account for ~1,460 input tokens (308 bytes / ~77 tokens across all 5 Flagsmith CLI calls)."
+  }
+}

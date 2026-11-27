@@ -2,9 +2,10 @@
 
 An agent asks to enable `new_search` for QA. It proposes turning the production default on, which would reach all 2,000 synthetic users in the FlagRadius sandbox. The MCP guard blocks the request and points to the 12-person `internal_testers` segment. Later, when a VIP loses access, the same guard evaluates the recovery after the diagnosis command finds the change in Git.
 
-Built for Toggle Wars Track 02, AI Agents and Feature Flags.
+Built for Toggle Wars — entering **Track 02** (AI Agents and Feature Flags), **Track 03** (Build on Open Source Flagsmith), and **Track 04** (Flagsmith Agent Skills).
 
-- **Demo Video (56s, 1080p30)**: https://youtu.be/ticc7dkmoqk
+- **Demo Video (1080p30)**: https://youtu.be/ticc7dkmoqk
+- **Agent Skill (Track 04)**: [skills/flagradius-safe-rollout/SKILL.md](/skills/flagradius-safe-rollout/SKILL.md) (follows [agentskills.io/specification](https://agentskills.io/specification); verified CLI `--no-input --jq` token benchmark in [eval/demo-run-receipt.json](/skills/flagradius-safe-rollout/eval/demo-run-receipt.json))
 
 ## Run the sandbox
 
@@ -58,6 +59,13 @@ Provide the Flagsmith API and environment settings from [.env.example](/.env.exa
 Run `npm run snapshot -- --env sandbox --init` to record a redacted Git baseline, or omit `--init` for a later manual capture. Both only read from Flagsmith.
 
 Diagnosis walks the Git history in order so a flag that flipped more than once still yields each recorded transition. An out-of-band change can appear as a live-to-HEAD `snapshot_gap`. Diagnosis reports candidate operations and their impact. Any recovery write starts with a separate proposal.
+
+## Agent Skill (`skills/flagradius-safe-rollout/`)
+
+FlagRadius ships a standalone [Agent Skill](/skills/flagradius-safe-rollout/SKILL.md) built on `@flagsmith/cli` v2.0.0 and progressive disclosure ([references/cli-jq-recipes.md](/skills/flagradius-safe-rollout/references/cli-jq-recipes.md)):
+
+- **Complete workflow**: preflight (`flagsmith config --no-input --jq`) -> compact flag & segment lookup (`flag get`, `segment list`) -> split-privilege blast-radius proposal (`BLOCKED_INTENT_MISMATCH` guard, auto-snapshotted small QA rollouts, or HTML Approval Card pause for VIP/over-budget writes) -> zero-write Git timeline diagnosis -> live read-back (`flagsmith evaluate --no-input --jq`) and one-line CLI rollback.
+- **Measured token efficiency** ([demo-run-receipt.json](/skills/flagradius-safe-rollout/eval/demo-run-receipt.json)): `SKILL.md` is 50 lines (~1,110 est. tokens) without opening reference files; all 5 `--no-input --jq` CLI outputs combined total **308 bytes (~77 tokens)** vs ~11.2 KB unfiltered JSON (~97% CLI output reduction). Verified end-to-end in 3 tool calls with Claude Code (`8,691` model output tokens; `~1,595` workflow payload input tokens; `63,881` full host-harness subagent tokens).
 
 ## Boundaries
 
